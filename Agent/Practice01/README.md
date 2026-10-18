@@ -1,0 +1,39 @@
+# chat
+
+一个极简的命令行聊天程序，调用 OpenAI 兼容的 Chat Completions 接口。
+
+## 依赖
+
+- Python 3
+- openai 库：`pip install openai`
+
+## 配置
+
+在 `chat.py` 同目录下创建 `config.ini`：
+
+```ini
+[default]
+base_url=https://api.deepseek.com
+model=deepseek-chat
+api_key=sk-xxx
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `base_url` | 接口地址，如 `https://api.deepseek.com` |
+| `model` | 模型名称，如 `deepseek-chat`、`gpt-4o-mini` |
+| `api_key` | API 密钥 |
+
+只读取以上三个配置项，其余参数使用接口默认值。
+
+## 使用
+
+```bash
+python chat.py
+```
+
+1. 启动后输入提示词，按回车结束。
+2. 程序打印一行 `---` 作为分隔。
+3. 回答以流式方式逐段实时打印。
+
+若配置文件不存在、缺少 `[default]` section 或任一字段缺失，程序会报错退出；API 调用失败也会报错退出。

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "pet-hospital": {
+      "type": "local",
+      "command": [
+        "C:\\Users\\27352\\AppData\\Local\\Programs\\Python\\Python313\\Scripts\\pet-hospital-mcp.exe",
+        "stdio"
+      ],
+      "enabled": true,
+      "environment": {
+        "PET_HOSPITAL_URL": "http://127.0.0.1:8080"
+      }
+    }
+  }
+}
