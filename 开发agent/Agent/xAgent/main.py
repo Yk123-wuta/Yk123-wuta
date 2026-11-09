@@ -57,13 +57,16 @@ def cmd_run(args: list[str]) -> int:
 
 
 def cmd_demo() -> int:
-    """对所有 10 个工具跑一遍核心逻辑测试，不依赖任何 UI。"""
+    """对所有文件工具跑一遍核心逻辑测试，不依赖任何 UI。"""
     import tempfile, os
     from xAgent.core import ToolService
 
+    previous_sandbox = os.environ.get("XAGENT_SANDBOX_ROOT")
     with tempfile.TemporaryDirectory() as tmp:
         work = os.path.join(tmp, "demo_root")
         os.makedirs(work)
+        # 演示目录位于临时目录，需把沙箱根指向它
+        os.environ["XAGENT_SANDBOX_ROOT"] = tmp
         results = []
 
         # 1. cwd
@@ -108,6 +111,11 @@ def cmd_demo() -> int:
         # 8. delete_directory
         r = ToolService.call("delete_directory", dir_path=work, force="true")
         results.append(("delete_directory", r.success))
+
+    if previous_sandbox is None:
+        os.environ.pop("XAGENT_SANDBOX_ROOT", None)
+    else:
+        os.environ["XAGENT_SANDBOX_ROOT"] = previous_sandbox
 
     ok = all(s for _, s in results)
     for name, success in results:

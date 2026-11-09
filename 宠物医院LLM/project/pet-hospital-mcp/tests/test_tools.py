@@ -230,7 +230,241 @@ async def test_upstream_http_error():
     client = HospitalClient(
         BASE_URL,
         transport=httpx.MockTransport(lambda r: httpx.Response(503, text="unavailable")),
+        max_retries=0,
     )
     with pytest.raises(UpstreamError) as exc:
         await client.get("/api/v1/pets")
     assert exc.value.status_code == 503
+    assert exc.value.code == "UPSTREAM_HTTP_ERROR"
+
+
+# --- A2: tool contract (enum / range constraints in the schema) -----------
+
+async def test_list_pets_schema_declares_enum_constraints():
+    mcp = server()
+    tools = {t.name: t for t in await mcp.list_tools()}
+    props = tools["list_pets"].input_schema["properties"]
+
+    assert set(props["species"]["anyOf"][0]["enum"]) == {
+        "犬", "猫", "兔", "鸟", "仓鼠", "爬宠", "其他"
+    }
+    assert set(props["gender"]["anyOf"][0]["enum"]) == {"公", "母"}
+    assert set(props["status"]["anyOf"][0]["enum"]) == {
+        "待就诊", "就诊中", "住院中", "已康复", "慢性病随访"
+    }
+    assert props["order"]["anyOf"][0]["enum"] == ["asc", "desc"]
+
+
+async def test_list_pets_schema_declares_numeric_ranges():
+    mcp = server()
+    tools = {t.name: t for t in await mcp.list_tools()}
+    props = tools["list_pets"].input_schema["properties"]
+
+    assert props["pageSize"]["anyOf"][0]["minimum"] == 1
+    assert props["pageSize"]["anyOf"][0]["maximum"] == 500
+    assert props["page"]["anyOf"][0]["minimum"] == 1
+    assert props["ageMin"]["anyOf"][0]["minimum"] == 0
+    assert props["max"]["anyOf"][0]["minimum"] == 0
+
+
+async def test_invalid_enum_argument_is_rejected():
+    mcp = server()
+    with pytest.raises(Exception):
+        await mcp.call_tool("list_pets", {"species": "恐龙"})
+
+
+# --- A3: structured tool errors ------------------------------------------
+
+async def test_tool_returns_structured_error_on_upstream_5xx():
+    mcp = server(lambda r: httpx.Response(503, text="<html>down</html>"))
+    res = await mcp.call_tool("list_pets", {"species": "犬"})
+
+    assert res.is_error is True
+    payload = json.loads(res.content[0].text)
+    assert payload["error"]["code"] == "UPSTREAM_HTTP_ERROR"
+    assert payload["error"]["status"] == 503
+    assert "503" in payload["error"]["message"]
+    # Upstream HTML must not be passed through verbatim.
+    assert "<html>" not in res.content[0].text
+
+
+async def test_tool_returns_structured_error_on_business_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=envelope({}, code=500, message="boom"))
+
+    mcp = server(handler)
+    res = await mcp.call_tool("list_pets", {})
+
+    assert res.is_error is True
+    payload = json.loads(res.content[0].text)
+    assert payload["error"]["code"] == "UPSTREAM_BUSINESS_ERROR"
+    assert payload["error"]["status"] == 500
+    assert "boom" in payload["error"]["message"]
+
+
+async def test_tool_returns_structured_error_on_unreachable_upstream():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    mcp = server(handler)
+    res = await mcp.call_tool("get_meta", {})
+
+    assert res.is_error is True
+    payload = json.loads(res.content[0].text)
+    assert payload["error"]["code"] == "UPSTREAM_UNAVAILABLE"
+
+
+# --- A4: retry on timeouts / 5xx -----------------------------------------
+
+async def test_retries_then_succeeds_on_5xx():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(503, text="busy")
+        return dataset_handler()(request)
+
+    client = HospitalClient(
+        BASE_URL,
+        transport=httpx.MockTransport(handler),
+        max_retries=2,
+        retry_backoff=0,
+    )
+    data = await client.get("/api/v1/meta")
+    assert data["species"] == ["犬", "猫", "兔"]
+    assert calls["n"] == 3
+
+
+async def test_retries_exhausted_on_persistent_5xx():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="boom")
+
+    client = HospitalClient(
+        BASE_URL,
+        transport=httpx.MockTransport(handler),
+        max_retries=1,
+        retry_backoff=0,
+    )
+    with pytest.raises(UpstreamError) as exc:
+        await client.get("/api/v1/pets")
+    assert calls["n"] == 2
+    assert exc.value.retryable is True
+
+
+async def test_retries_on_timeout():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ReadTimeout("slow", request=request)
+        return dataset_handler()(request)
+
+    client = HospitalClient(
+        BASE_URL,
+        transport=httpx.MockTransport(handler),
+        max_retries=1,
+        retry_backoff=0,
+    )
+    data = await client.get("/api/v1/meta")
+    assert data["gender"] == ["公", "母"]
+    assert calls["n"] == 2
+
+
+async def test_timeout_after_retries_raises_timeout_code():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    client = HospitalClient(
+        BASE_URL,
+        transport=httpx.MockTransport(handler),
+        max_retries=1,
+        retry_backoff=0,
+    )
+    with pytest.raises(UpstreamError) as exc:
+        await client.get("/api/v1/pets")
+    assert exc.value.code == "UPSTREAM_TIMEOUT"
+
+
+async def test_4xx_is_not_retried():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(404, text="missing")
+
+    client = HospitalClient(
+        BASE_URL,
+        transport=httpx.MockTransport(handler),
+        max_retries=2,
+        retry_backoff=0,
+    )
+    with pytest.raises(UpstreamError):
+        await client.get("/api/v1/nope")
+    assert calls["n"] == 1
+
+
+# --- A4: call logging to disk --------------------------------------------
+
+async def test_tool_calls_are_logged_to_file(tmp_path):
+    import logging
+
+    from hospital_mcp import server as server_module
+
+    log_path = tmp_path / "calls.log"
+    base_logger = logging.getLogger("hospital_mcp")
+    previous_handlers = list(base_logger.handlers)
+    previous_propagate = base_logger.propagate
+    previous_level = base_logger.level
+    try:
+        server_module.setup_logging(str(log_path), "INFO")
+        mcp = server()
+        await call(mcp, "list_pets", {"species": "犬", "pageSize": 1})
+    finally:
+        for handler in list(base_logger.handlers):
+            if getattr(handler, "_hospital_mcp_handler", False):
+                base_logger.removeHandler(handler)
+                handler.close()
+        for handler in previous_handlers:
+            base_logger.addHandler(handler)
+        base_logger.propagate = previous_propagate
+        base_logger.setLevel(previous_level)
+
+    text = log_path.read_text(encoding="utf-8")
+    assert "tool=list_pets event=start" in text
+    assert "species=犬" in text
+    assert "event=ok" in text
+    assert "elapsed_ms=" in text
+
+
+async def test_failed_tool_call_logs_error(tmp_path):
+    import logging
+
+    from hospital_mcp import server as server_module
+
+    log_path = tmp_path / "errors.log"
+    base_logger = logging.getLogger("hospital_mcp")
+    previous_handlers = list(base_logger.handlers)
+    previous_propagate = base_logger.propagate
+    previous_level = base_logger.level
+    try:
+        server_module.setup_logging(str(log_path), "INFO")
+        mcp = server(lambda r: httpx.Response(503, text="down"))
+        await mcp.call_tool("list_pets", {})
+    finally:
+        for handler in list(base_logger.handlers):
+            if getattr(handler, "_hospital_mcp_handler", False):
+                base_logger.removeHandler(handler)
+                handler.close()
+        for handler in previous_handlers:
+            base_logger.addHandler(handler)
+        base_logger.propagate = previous_propagate
+        base_logger.setLevel(previous_level)
+
+    text = log_path.read_text(encoding="utf-8")
+    assert "event=upstream_error" in text
+    assert "code=UPSTREAM_HTTP_ERROR" in text

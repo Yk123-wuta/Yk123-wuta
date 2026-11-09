@@ -1,14 +1,17 @@
 # Yk123-wuta
 
-这是一个以 AI Agent、MCP（Model Context Protocol）和本地知识库/业务数据接入为主题的学习与实践项目仓库，主要用于探索如何将不同的数据源和工具能力接入到 AI Agent 中。
+以 AI Agent、MCP（Model Context Protocol）和本地知识库/业务数据接入为主题的学习与实践仓库。
 
-本仓库包含三个核心部分：
+本仓库包含四个可直接运行的模块：
 
-- 一个简易的聊天脚本示例
-- 一个 AnythingLLM 的 MCP 适配层
-- 一个宠物医院数据的 MCP 适配层
+| 模块 | 目录 | 定位 |
+|---|---|---|
+| 定制 Agent（xAgent） | `开发agent/Agent/xAgent/` | 分层架构的文件操作 Agent：18 个本地工具、技能加载、MCP 客户端、AGENTS.md 注入、会话与上下文压缩、Textual TUI |
+| 宠物医院 MCP | `宠物医院LLM/project/pet-hospital-mcp/` | 把宠物医院 REST API 封装为 MCP Server（2 个业务工具），支持 stdio 与 Streamable HTTP |
+| AnythingLLM MCP | `宠物医院LLM/AnythingLLM MCP/` | 把 AnythingLLM 的工作区、文档上传/向量化、知识库问答封装为 MCP Server（8 个工具） |
+| AnythingLLM Webpage | `宠物医院LLM/AnythingLLM Sever/` | 单页上传工具 + 本地代理，浏览器不接触 API Key |
 
-通过这些示例，学习如何把本地服务、知识库、数据库和 AI 模型连接起来，并让 Agent 以标准方式调用它们。
+此外还有一个入门聊天脚本 `Agent/Practice01/`，演示如何调用 OpenAI 兼容接口。
 
 ---
 
@@ -17,204 +20,200 @@
 ```text
 Yk123-wuta/
 ├── Agent/
-│   └── Practice01/
+│   └── Practice01/                      入门聊天脚本（OpenAI 兼容接口）
 │       ├── chat.py
-│       ├── config.ini
 │       └── README.md
-├── LLM/
-│   ├── README.md
-│   ├── AnythingLLM MCP/
+├── 宠物医院LLM/
+│   ├── README.md                        模块总览
+│   ├── AnythingLLM MCP/                 MCP Server（8 个工具）
+│   │   ├── README.md
+│   │   ├── .env.example
 │   │   ├── opencode.json
 │   │   ├── pyproject.toml
-│   │   ├── src/
-│   │   │   └── anythingllm_mcp/
+│   │   ├── src/anythingllm_mcp/
 │   │   └── tests/
-│   ├── project/
-│   │   ├── opencode.json
-│   │   ├── pet-hospital-mcp-prompt.md
-│   │   ├── pet-hospital-mcp/
-│   │   └── pet-hospital-windows-amd64/
-│   └── ...
+│   ├── AnythingLLM Sever/               网页上传页面 + 本地代理
+│   │   ├── README.md
+│   │   ├── serve.py
+│   │   └── upload.html
+│   └── project/
+│       ├── opencode.json
+│       ├── pet-hospital-mcp-prompt.md
+│       ├── 宠物清单摘要.txt
+│       ├── pet-hospital-mcp/            MCP Server（2 个工具）
+│       │   ├── README.md
+│       │   ├── pyproject.toml
+│       │   ├── src/hospital_mcp/
+│       │   └── tests/
+│       └── pet-hospital-windows-amd64/
+│           └── windows/                 上游预编译程序与数据库（非自研代码）
+│               ├── pethospital.exe
+│               ├── data/pet.db
+│               ├── LICENSE
+│               ├── README.md
+│               └── README-Windows.md
+├── 开发agent/
+│   └── Agent/
+│       ├── Practice02/                  文件操作 Agent 原型与回归测试
+│       └── xAgent/                      分层文件操作 Agent（core + tui）
+│           ├── README.md
+│           ├── requirements.txt
+│           ├── main.py
+│           ├── core/
+│           ├── tui/
+│           └── tests/
 └── README.md
 ```
 
----
+> `pethospital.exe`（约 6.5MB）与 `data/pet.db`（约 2.4MB）是课程/上游提供的**预编译可执行程序与数据库文件**，随上游 LICENSE 与 README 一同分发，**不是本仓库自行开发的代码**。仓库保留它们仅用于本地联调，请勿将其视为自研成果。
 
-## 1. Agent / Practice01
+> 仓库另有一个历史归档目录 `新建文件夹/`，其中只保留了 `Agent/Practice02/chat-stream-tool-fileops.py` 的一份副本。
+> 经 MD5 校验，它与 `开发agent/Agent/Practice02/chat-stream-tool-fileops.py` 完全一致
+> （`EF541263140ABA6C7ECA5D22ABA943CC`）。是否移除该副本涉及 Git 提交，需由维护者确认后另行处理。
 
-这个目录下是一个极简的聊天脚本示例，主要演示：
-
-- 配置 OpenAI 兼容接口的参数
-- 调用模型的 Chat Completions API
-- 使用流式输出逐段返回文本
-
-适合初学者快速理解“如何让 Python 程序调用大语言模型”。
-
-相关文件：
-
-- [Agent/Practice01/chat.py](Agent/Practice01/chat.py)
-- [Agent/Practice01/config.ini](Agent/Practice01/config.ini)
 
 ---
 
-## 2. AnythingLLM MCP
+## 模块关系
 
-这是一个把 AnythingLLM 工作区能力封装为 MCP 工具的项目。
+```text
+xAgent（MCP Client）
+   ├─ stdio / Streamable HTTP ──> 宠物医院 MCP ──HTTP──> pethospital.exe (127.0.0.1:8080)
+   └─ Streamable HTTP ──────────> AnythingLLM MCP ──HTTP──> AnythingLLM (localhost:3001/api)
 
-它的作用是：
+AnythingLLM Webpage（upload.html）
+   └─ 同源请求 ──> 本地代理 serve.py ──Bearer Key──> AnythingLLM Developer API
+```
 
-- 读取配置中的 AnythingLLM API 地址和密钥
-- 连接本地或远程的 AnythingLLM 实例
-- 暴露工作区管理和问答能力
-- 让 AI Agent 能通过标准的 MCP 调用方式访问知识库
-
-主要能力包括：
-
-- `list_workspaces`
-- `get_workspace`
-- `create_workspace`
-- `update_workspace`
-- `delete_workspace`
-- `ask`
-
-相关目录：
-
-- [LLM/AnythingLLM MCP](LLM/AnythingLLM%20MCP)
+- xAgent 通过工作目录下的 `.mcp.json` 接入任一 MCP Server；连接失败会降级并在 TUI 中显示状态。
+- 两个 MCP Server 均可独立启动，也可同时挂到同一个客户端。
+- Webpage 模块不经过 MCP，直接由本地代理访问 AnythingLLM API。
 
 ---
 
-## 3. 宠物医院 MCP
+## 环境依赖
 
-这个项目是本仓库中更贴近实际业务场景的部分，目标是将宠物医院的 REST API 封装成标准 MCP 工具，让 Agent 能直接查询宠物档案信息。
-
-它的特点：
-
-- 支持本地 stdio 传输
-- 支持 Streamable HTTP 远程访问
-- 通过 MCP 工具暴露查询能力
-- 提供筛选、排序、分页等逻辑
-
-当前主要工具：
-
-- `get_meta`
-- `list_pets`
-
-它适合用来演示：
-
-- 如何把传统 REST API 接入 MCP
-- 如何让 Agent 通过标准协议访问业务数据
-- 如何在 AI 智能体中接入真实业务系统
-
-相关目录：
-
-- [LLM/project/pet-hospital-mcp](LLM/project/pet-hospital-mcp)
-- [LLM/project/pet-hospital-mcp-prompt.md](LLM/project/pet-hospital-mcp-prompt.md)
+- Python 3.10+
+- 宠物医院 MCP：`mcp>=2.0`、`httpx>=0.27`、`pydantic>=2.0`、`uvicorn>=0.30`
+- AnythingLLM MCP：`mcp>=2.2.0`、`httpx2>=2.0.0`
+- xAgent：`textual>=8.0`、`trafilatura>=2.0`、`mcp>=2.0`（`core` 文件工具本身只用标准库）
+- AnythingLLM Sever：仅用 Python 标准库
+- 上游服务：本地运行的宠物医院 `pethospital.exe`（默认 `http://127.0.0.1:8080`）与 AnythingLLM 实例（Developer API 默认 `http://localhost:3001/api`）
 
 ---
 
-## 运行方式
+## 配置与密钥
 
-### 1. 运行聊天脚本
+- 所有真实密钥都通过**环境变量或本地配置文件**注入，不写入源码、不提交到仓库。
+- AnythingLLM MCP 提供了配置模板 [.env.example](宠物医院LLM/AnythingLLM%20MCP/.env.example)。
+- AnythingLLM Webpage 的 Key 只存在于 `serve.py` 进程的环境变量中，前端页面不保存、不硬编码。
+- xAgent 首次运行会在工作目录生成 `config.ini`（含 Mock 配置），请在本地填写后再启动，并确保该文件不被提交。
+- 若你曾在历史提交中暴露过真实 API Key，删除代码并不等于密钥失效，请到服务控制台吊销并重新生成。
 
-先在 [Agent/Practice01/config.ini](Agent/Practice01/config.ini) 中填写模型地址和密钥，然后执行：
+---
+
+## 分步启动
+
+### 1. 入门聊天脚本（Agent/Practice01）
 
 ```bash
 cd Agent/Practice01
+pip install openai
+# 在 chat.py 同目录创建 config.ini（该文件被忽略，不入库）：
+#   [default]
+#   base_url=https://api.deepseek.com
+#   model=deepseek-chat
+#   api_key=sk-xxx
 python chat.py
 ```
 
----
+### 2. 宠物医院 MCP
 
-### 2. 启动 AnythingLLM MCP
-
-进入项目目录：
+前置：先启动宠物医院上游服务，确认 `http://127.0.0.1:8080/health` 可用。
 
 ```bash
-cd "LLM/AnythingLLM MCP"
+cd "宠物医院LLM/project/pet-hospital-mcp"
 pip install -e .
+pet-hospital-mcp http --port 8301          # Streamable HTTP: http://127.0.0.1:8301/mcp
+# 或：pet-hospital-mcp stdio               # 供本地 Agent 以子进程方式接入
 ```
 
-然后按实际环境启动：
+上游地址可用 `PET_HOSPITAL_URL` 覆盖；完整环境变量、错误格式与参数约束见
+[pet-hospital-mcp/README.md](宠物医院LLM/project/pet-hospital-mcp/README.md)。
+
+### 3. AnythingLLM MCP
+
+前置：AnythingLLM 已启动，并在 Settings → Tools 中生成 Developer API Key。
 
 ```bash
-python -m anythingllm_mcp.server
-```
-
-或通过配置文件接入到 OpenCode / MCP 客户端。
-
----
-
-### 3. 启动宠物医院 MCP
-
-进入目录：
-
-```bash
-cd "LLM/project/pet-hospital-mcp"
+cd "宠物医院LLM/AnythingLLM MCP"
 pip install -e .
+# PowerShell 示例：
+$env:ANYTHINGLLM_API_KEY = "你的 Developer API Key"
+$env:ANYTHINGLLM_BASE_URL = "http://localhost:3001/api"   # 可选
+anythingllm-mcp                            # 默认 Streamable HTTP: http://127.0.0.1:8000/mcp
+# 等价入口：python -m anythingllm_mcp
 ```
 
-本地 stdio 方式：
+8 个工具、每个工具的入参和调用示例见
+[AnythingLLM MCP/README.md](宠物医院LLM/AnythingLLM%20MCP/README.md)。
+
+### 4. AnythingLLM 网页上传（AnythingLLM Sever）
 
 ```bash
-python -m hospital_mcp.server stdio
+cd "宠物医院LLM/AnythingLLM Sever"
+# PowerShell 示例：
+$env:ANYTHINGLLM_API_KEY = "你的 Developer API Key"
+$env:ANYTHINGLLM_BASE_URL = "http://localhost:3001/api"   # 可选
+python serve.py
+# 浏览器打开 http://127.0.0.1:3002/
 ```
 
-HTTP 方式：
+页面会从代理拉取工作区列表、上传文件并触发生成向量；所有动态内容使用 `textContent` 写入。
+详见 [AnythingLLM Sever/README.md](宠物医院LLM/AnythingLLM%20Sever/README.md)。
+
+### 5. xAgent
 
 ```bash
-python -m hospital_mcp.server http --port 8301
+cd 开发agent/Agent
+pip install -r xAgent/requirements.txt
+python xAgent/main.py        # 启动 Textual TUI
 ```
 
----
+首次启动会在当前目录生成 `config.ini`：默认 `provider=mock`（不联网）。要接入真实模型，
+把 `[llm]` 改为 `provider=qianfan` 并填写 `api_key` / `model` / `search_model`（也可用
+`QIANFAN_API_KEY` 等环境变量覆盖）。
 
-## 适合的学习目标
+其他入口：
 
-这个项目特别适合用于以下几类学习：
+```bash
+python xAgent/main.py --list      # 列出全部工具（含已连接的 MCP 工具）
+python xAgent/main.py --demo      # core 层文件工具烟雾测试
+python xAgent/main.py --run is_leap_year year=2024
+```
 
-1. AI Agent 基础接入
-2. MCP 协议入门与实践
-3. 把大型模型接到真实数据源
-4. 把本地知识库和业务系统封装成标准工具
-5. 从 demo 逐步走向真实生产能力
+xAgent 的 18 个工具、`.mcp.json` 配置、AGENTS.md 注入、路径沙箱、调用日志与测试方式见
+[xAgent/README.md](开发agent/Agent/xAgent/README.md)。
 
 ---
 
 ## 技术栈
 
-- Python
-- OpenAI 兼容 SDK
-- MCP（Model Context Protocol）
-- AnythingLLM
-- HTTP / REST API
-- OpenCode 作为 MCP 客户端配置示例
+- Python 3.10+
+- MCP Python SDK（MCP Server / MCP Client）
+- OpenAI 兼容 Chat Completions / 千帆智能搜索 API
+- AnythingLLM Developer API
+- Textual（终端 UI）、trafilatura（网页正文提取）
+- HTTP / REST / Streamable HTTP / stdio
 
 ---
 
-## 备注
+## 文档索引
 
-这个仓库更偏向“学习型项目”和“实践型项目”，而不是一个正式的生产级应用。它的目的是帮助我理解：
-
-- AI 如何访问外部数据
-- MCP 如何统一不同工具的访问方式
-- Agent 如何更自然地调用知识库和业务系统
-
-如果你在继续开发这个项目，可以把它逐步扩展成：
-
-- 更完整的宠物医院数据查询工具集
-- 更强的 AnythingLLM 工作区管理能力
-- 更稳定的 Agent 工作流
-- 更完善的 README 和文档说明
-
----
-
-## 结语
-
-这个仓库记录了我在 AI Agent 与 MCP 方向上的探索与实践，适合用于学习、原型开发以及后续功能扩展。
-
-如果你想继续深入，可以从以下顺序入手：
-
-1. 先理解 [Agent/Practice01/chat.py](Agent/Practice01/chat.py)
-2. 再看 [LLM/AnythingLLM MCP](LLM/AnythingLLM%20MCP)
-3. 最后研究 [LLM/project/pet-hospital-mcp](LLM/project/pet-hospital-mcp)
-
-这样会更容易理解整个项目的设计思路。
+- [宠物医院LLM 模块总览](宠物医院LLM/README.md)
+- [宠物医院 MCP](宠物医院LLM/project/pet-hospital-mcp/README.md)
+- [AnythingLLM MCP](宠物医院LLM/AnythingLLM%20MCP/README.md)
+- [AnythingLLM Webpage](宠物医院LLM/AnythingLLM%20Sever/README.md)
+- [xAgent](开发agent/Agent/xAgent/README.md)
+- [Practice02](开发agent/Agent/Practice02/README.md)
+- [Practice01](Agent/Practice01/README.md)

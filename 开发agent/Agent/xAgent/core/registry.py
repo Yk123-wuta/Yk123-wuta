@@ -16,13 +16,17 @@ import os
 import re
 import shlex
 import threading
+import time
 from typing import Any, Callable, Dict, List
 
 from .types import ToolResult, ToolInfo
 from .mcp_client import get_mcp_manager
 from .context import recall_context
+from .call_log import log_tool_call
 from .tools import (
     get_current_working_directory,
+    get_current_datetime,
+    is_leap_year,
     list_directory,
     get_file_type,
     read_file,
@@ -53,6 +57,22 @@ TOOL_META: Dict[str, ToolInfo] = {
         name="get_current_working_directory",
         description="获取当前工作目录",
         parameters={},
+    ),
+    "get_current_datetime": ToolInfo(
+        name="get_current_datetime",
+        description=(
+            "获取当前日期时间：返回本地时间、UTC 时间、时区与时间戳"
+            "（读取真实系统时钟，跨平台）"
+        ),
+        parameters={},
+    ),
+    "is_leap_year": ToolInfo(
+        name="is_leap_year",
+        description=(
+            "判断指定年份是否为闰年"
+            "（规则：能被 4 整除且不能被 100 整除，或能被 400 整除）"
+        ),
+        parameters={"year": "int: 待判断的年份，1-9999（必需）"},
     ),
     "list_directory": ToolInfo(
         name="list_directory",
@@ -176,6 +196,8 @@ TOOL_META: Dict[str, ToolInfo] = {
 # 工具函数绑定
 TOOL_FUNCS: Dict[str, Callable[..., dict]] = {
     "get_current_working_directory": get_current_working_directory,
+    "get_current_datetime": get_current_datetime,
+    "is_leap_year": is_leap_year,
     "list_directory": list_directory,
     "get_file_type": get_file_type,
     "read_file": read_file,
@@ -489,15 +511,27 @@ def call_tool_result(tool_name: str, **kwargs: Any) -> ToolResult:
     if func is None:
         return ToolResult.fail(f"未知工具: {tool_name}")
 
+    started = time.time()
+    converted: Dict[str, Any] = {}
     try:
         converted = _convert_kwargs(tool_name, kwargs)
         raw = func(**converted)
         # tools.py 函数已经返回 dict，直接转 ToolResult
-        return ToolResult.from_dict(raw)
+        result = ToolResult.from_dict(raw)
     except TypeError as e:
-        return ToolResult.fail(f"参数错误: {str(e)}")
+        result = ToolResult.fail(f"参数错误: {str(e)}")
     except Exception as e:
-        return ToolResult.fail(str(e))
+        result = ToolResult.fail(str(e))
+
+    # 调用日志落盘（与 TUI 展示分离，失败不影响调用结果）
+    log_tool_call(
+        tool_name,
+        converted,
+        result.to_dict(),
+        int((time.time() - started) * 1000),
+        success=result.success,
+    )
+    return result
 
 
 # ---------- ToolService 门面（UI 层唯一入口） ----------

@@ -19,13 +19,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import logging
 import math
 import sys
-from typing import Any
+import time
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
+from mcp.types import CallToolResult, TextContent
+from pydantic import Field
 
 from .config import config
 from .upstream import HospitalClient, UpstreamError
@@ -50,7 +55,146 @@ UPSTREAM_FILTER_KEYS = (
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 500
 
+# Enum values mirror `GET /api/v1/meta` (the authoritative source at runtime).
+Species = Literal["犬", "猫", "兔", "鸟", "仓鼠", "爬宠", "其他"]
+Gender = Literal["公", "母"]
+Status = Literal["待就诊", "就诊中", "住院中", "已康复", "慢性病随访"]
+SortOrder = Literal["asc", "desc"]
+
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
 logger = logging.getLogger(__name__)
+
+
+def setup_logging(log_file: str | None = None, level: str | None = None) -> None:
+    """Configure file + stderr logging for the `hospital_mcp` logger.
+
+    Safe to call repeatedly: handlers installed by a previous call are replaced.
+    """
+    base_logger = logging.getLogger("hospital_mcp")
+    for handler in list(base_logger.handlers):
+        if getattr(handler, "_hospital_mcp_handler", False):
+            base_logger.removeHandler(handler)
+            handler.close()
+
+    log_path = Path(log_file or config.log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_level = getattr(
+        logging, (level or config.log_level).upper(), logging.INFO
+    )
+
+    formatter = logging.Formatter(LOG_FORMAT)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    file_handler._hospital_mcp_handler = True  # type: ignore[attr-defined]
+
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setFormatter(formatter)
+    stream_handler._hospital_mcp_handler = True  # type: ignore[attr-defined]
+
+    base_logger.setLevel(resolved_level)
+    base_logger.addHandler(file_handler)
+    base_logger.addHandler(stream_handler)
+    base_logger.propagate = False
+    logger.info(
+        "logging configured file=%s level=%s",
+        log_path,
+        logging.getLevelName(resolved_level),
+    )
+
+
+def _summarize_args(args: dict[str, Any], limit: int = 240) -> str:
+    """Return a compact, log-safe summary of the supplied tool arguments."""
+    parts: list[str] = []
+    for key, value in args.items():
+        if value is None:
+            continue
+        text = str(value)
+        if len(text) > 40:
+            text = text[:37] + "..."
+        parts.append(f"{key}={text}")
+    summary = ", ".join(parts) or "(none)"
+    return summary[:limit]
+
+
+def _summarize_result(result: Any, limit: int = 120) -> str:
+    """Return a compact summary of the tool payload for the call log."""
+    if isinstance(result, str):
+        text = result
+    else:
+        text = json.dumps(result, ensure_ascii=False, default=str)
+    preview = text[:limit].replace("\n", " ")
+    return f"chars={len(text)} preview={preview}"
+
+
+def _upstream_error_result(exc: UpstreamError) -> CallToolResult:
+    """Build an MCP error result carrying a stable error code and message."""
+    error: dict[str, Any] = {
+        "code": exc.code,
+        "message": exc.message,
+        "retryable": exc.retryable,
+    }
+    if exc.status_code is not None:
+        error["status"] = exc.status_code
+    if exc.detail:
+        error["detail"] = exc.detail
+    payload = json.dumps({"error": error}, ensure_ascii=False)
+    return CallToolResult(
+        content=[TextContent(type="text", text=payload)],
+        isError=True,
+    )
+
+
+def _tool_call(tool_name: str):
+    """Log every tool invocation and convert UpstreamError to a structured error.
+
+    Records the tool name, argument summary, elapsed time and result summary;
+    upstream failures become `CallToolResult(isError=True)` instead of leaking
+    raw exceptions to the client.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            started = time.perf_counter()
+            logger.info(
+                "tool=%s event=start args=%s",
+                tool_name,
+                _summarize_args(kwargs),
+            )
+            try:
+                result = await fn(*args, **kwargs)
+            except UpstreamError as exc:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                logger.error(
+                    "tool=%s event=upstream_error code=%s status=%s elapsed_ms=%.1f message=%s",
+                    tool_name,
+                    exc.code,
+                    exc.status_code,
+                    elapsed_ms,
+                    exc.message,
+                )
+                return _upstream_error_result(exc)
+            except Exception:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                logger.exception(
+                    "tool=%s event=crash elapsed_ms=%.1f",
+                    tool_name,
+                    elapsed_ms,
+                )
+                raise
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.info(
+                "tool=%s event=ok elapsed_ms=%.1f result=%s",
+                tool_name,
+                elapsed_ms,
+                _summarize_result(result),
+            )
+            return result
+
+        return wrapper
+
+    return decorator
 
 
 def _matches_client_filters(
@@ -113,7 +257,10 @@ def build_server(base_url: str, client_factory=None) -> MCPServer:
 
     mcp = MCPServer(SERVER_NAME, version=SERVER_VERSION)
 
-    @mcp.tool()
+    # `structured_output=False`: tools return JSON text (or a structured error
+    # result), so no output schema should be derived from the `-> str` hint.
+    @mcp.tool(structured_output=False)
+    @_tool_call("get_meta")
     async def get_meta() -> str:
         """获取筛选枚举字典 / Get enum dictionaries for filtering.
 
@@ -134,27 +281,60 @@ def build_server(base_url: str, client_factory=None) -> MCPServer:
         data = await client.get("/api/v1/meta")
         return json.dumps(data, ensure_ascii=False, default=str)
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
+    @_tool_call("list_pets")
     async def list_pets(
         q: str | None = None,
         name: str | None = None,
         ownerName: str | None = None,
         ownerPhone: str | None = None,
-        species: str | None = None,
+        species: Annotated[
+            Species, Field(description="动物种类，枚举见 get_meta")
+        ]
+        | None = None,
         breed: str | None = None,
-        gender: str | None = None,
-        ageMonths: int | None = None,
-        ageMin: int | None = None,
-        ageMax: int | None = None,
+        gender: Annotated[Gender, Field(description="性别：公 / 母")]
+        | None = None,
+        ageMonths: Annotated[
+            int, Field(ge=0, description="精确月龄（含），非负整数")
+        ]
+        | None = None,
+        ageMin: Annotated[
+            int, Field(ge=0, description="月龄下限（含），非负整数")
+        ]
+        | None = None,
+        ageMax: Annotated[
+            int, Field(ge=0, description="月龄上限（含），非负整数")
+        ]
+        | None = None,
         doctor: str | None = None,
         disease: str | None = None,
-        status: str | None = None,
-        min: float | None = None,
-        max: float | None = None,
+        status: Annotated[
+            Status, Field(description="就诊状态，枚举见 get_meta")
+        ]
+        | None = None,
+        min: Annotated[
+            float, Field(ge=0, description="总花费下限（元，含），非负数")
+        ]
+        | None = None,
+        max: Annotated[
+            float, Field(ge=0, description="总花费上限（元，含），非负数")
+        ]
+        | None = None,
         sortBy: str | None = None,
-        order: str | None = None,
-        page: int | None = None,
-        pageSize: int | None = None,
+        order: Annotated[
+            SortOrder, Field(description="排序方向：asc 升序 / desc 降序")
+        ]
+        | None = None,
+        page: Annotated[
+            int, Field(ge=1, description="页码，从 1 开始")
+        ]
+        | None = None,
+        pageSize: Annotated[
+            int,
+            Field(ge=1, le=MAX_PAGE_SIZE, description="每页条数，1-500"),
+        ]
+        | None = None,
     ) -> str:
         """列出/筛选宠物档案 / List and filter pet records.
 
@@ -253,13 +433,11 @@ def build_server(base_url: str, client_factory=None) -> MCPServer:
 
 
 async def _run_stdio(base_url: str) -> None:
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     mcp = build_server(base_url)
     await mcp.run_stdio_async()
 
 
 async def _run_http(base_url: str, host: str, port: int, path: str) -> None:
-    logging.basicConfig(level=logging.INFO)
     mcp = build_server(base_url)
     await mcp.run_streamable_http_async(
         host=host,
@@ -306,6 +484,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    setup_logging()
     parser = build_parser()
     args = parser.parse_args(argv)
     base_url = (args.base_url or config.pet_hospital_url).rstrip("/")

@@ -7,8 +7,10 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from mcp import types
 
@@ -52,16 +54,49 @@ class TestMcpConfig(unittest.TestCase):
             self.assertEqual(configs[0].url, "http://127.0.0.1:8090/mcp")
             self.assertEqual(warnings, [])
 
+    def test_stdio_config_parsed(self):
+        with self._write(json.dumps({
+            "mcpServers": {
+                "local": {
+                    "type": "stdio",
+                    "command": "python",
+                    "args": ["-m", "pet_hospital_mcp"],
+                    "env": {"PET_API": "http://127.0.0.1:8080"},
+                    "cwd": "C:/work",
+                }
+            }
+        })) as tmp:
+            configs, warnings = load_mcp_config(tmp)
+            self.assertEqual(warnings, [])
+            self.assertEqual(len(configs), 1)
+            cfg = configs[0]
+            self.assertEqual(cfg.transport, "stdio")
+            self.assertEqual(cfg.command, "python")
+            self.assertEqual(cfg.args, ["-m", "pet_hospital_mcp"])
+            self.assertEqual(cfg.env, {"PET_API": "http://127.0.0.1:8080"})
+            self.assertEqual(cfg.cwd, "C:/work")
+            self.assertEqual(cfg.target, "stdio: python -m pet_hospital_mcp")
+
+    def test_stdio_missing_command_skipped(self):
+        with self._write(json.dumps({
+            "mcpServers": {"broken": {"type": "stdio", "args": ["-m"]}}
+        })) as tmp:
+            configs, warnings = load_mcp_config(tmp)
+            self.assertEqual(configs, [])
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("command", warnings[0])
+
     def test_unsupported_transport_and_missing_url(self):
         with self._write(json.dumps({
             "mcpServers": {
-                "stdio": {"type": "stdio", "command": "python"},
+                "sse": {"type": "sse", "url": "http://127.0.0.1:8090/sse"},
                 "nourl": {"type": "http"},
             }
         })) as tmp:
             configs, warnings = load_mcp_config(tmp)
             self.assertEqual(configs, [])
             self.assertEqual(len(warnings), 2)
+            self.assertTrue(any("不支持" in warning for warning in warnings))
 
     def test_invalid_json(self):
         with self._write("{not json") as tmp:
@@ -195,6 +230,71 @@ def _fake_tools(*names: str):
         SimpleNamespace(name=name, description=f"{name} 工具", input_schema={})
         for name in names
     ]
+
+
+class _FakeSession:
+    """模拟 mcp.ClientSession（异步上下文管理器 + initialize/list_tools）。"""
+
+    def __init__(self, read_stream=None, write_stream=None) -> None:
+        self.read_stream = read_stream
+        self.write_stream = write_stream
+        self.initialized = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def initialize(self):
+        self.initialized = True
+
+    async def list_tools(self):
+        return SimpleNamespace(tools=_fake_tools("ping", "pong"))
+
+
+class TestStdioTransport(unittest.TestCase):
+    """D5：stdio 传输使用子进程 stdin/stdout，与 HTTP 分支共存。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.manager = MCPClientManager(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.manager.shutdown()
+        self.tmp.cleanup()
+
+    def test_open_server_uses_stdio_client(self):
+        captured = {}
+
+        @asynccontextmanager
+        async def fake_stdio(params):
+            captured["params"] = params
+            yield ("read-stream", "write-stream")
+
+        cfg = MCPServerConfig(
+            name="local",
+            transport="stdio",
+            command="python",
+            args=["-m", "pet_hospital_mcp"],
+            env={"PET_API": "http://127.0.0.1:8080"},
+            cwd=self.tmp.name,
+        )
+        with mock.patch("mcp.client.stdio.stdio_client", fake_stdio), \
+                mock.patch("mcp.ClientSession", _FakeSession):
+            state = asyncio.run(self.manager._open_server(cfg))
+
+        self.assertEqual(state.config.transport, "stdio")
+        self.assertEqual([tool.name for tool in state.tools], ["ping", "pong"])
+        self.assertTrue(state.session.initialized)
+        self.assertEqual(captured["params"].command, "python")
+        self.assertEqual(captured["params"].args, ["-m", "pet_hospital_mcp"])
+        self.assertEqual(captured["params"].cwd, self.tmp.name)
+
+    def test_http_transport_still_default(self):
+        cfg = MCPServerConfig(name="remote", url="http://127.0.0.1:8090/mcp")
+        self.assertEqual(cfg.transport, "http")
+        self.assertEqual(cfg.target, "http://127.0.0.1:8090/mcp")
 
 
 class TestReconnect(unittest.TestCase):

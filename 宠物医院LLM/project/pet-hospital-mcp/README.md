@@ -65,6 +65,17 @@ python -m hospital_mcp.server http --port 8301
 | `PET_HOSPITAL_URL` | `http://127.0.0.1:8080` | 宠物医院 REST API 地址 |
 | `MCP_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址 |
 | `MCP_HTTP_PORT` | `8301` | HTTP 监听端口 |
+| `PET_HOSPITAL_TIMEOUT` | `10` | 单次上游请求超时（秒） |
+| `PET_HOSPITAL_MAX_RETRIES` | `2` | 超时 / HTTP 5xx 的最大重试次数（总尝试 = 重试 + 1） |
+| `PET_HOSPITAL_RETRY_BACKOFF` | `0.15` | 重试指数退避基数（秒），第 n 次重试等待 `base * 2^n` |
+| `MCP_LOG_FILE` | `logs/pet-hospital-mcp.log` | 日志文件路径（相对当前工作目录） |
+| `MCP_LOG_LEVEL` | `INFO` | 日志级别（`DEBUG` / `INFO` / `WARNING` / `ERROR`） |
+
+也可用命令行参数覆盖地址与端口：
+
+```bash
+pet-hospital-mcp http --base-url http://127.0.0.1:8080 --host 127.0.0.1 --port 8301 --path /mcp
+```
 
 ## MCP 工具清单
 
@@ -93,6 +104,65 @@ python -m hospital_mcp.server http --port 8301
 - `list_pets(species="猫", ageMin=12, ageMax=60, sortBy="totalCost", order="desc")`：按月龄区间 + 排序
 - `list_pets(ownerPhone="13800001111")`：按主人电话查询
 - `list_pets(min=1000, max=5000, sortBy="totalCost", order="desc")`：按总花费区间 + 排序
+
+## 参数约束（工具 schema）
+
+工具 schema 直接由类型注解 + `pydantic.Field` 生成，客户端 `tools/list` 能看到以下约束，
+不需要先读业务代码：
+
+| 参数 | 约束 |
+| --- | --- |
+| `species` | 枚举：`犬`、`猫`、`兔`、`鸟`、`仓鼠`、`爬宠`、`其他` |
+| `gender` | 枚举：`公`、`母` |
+| `status` | 枚举：`待就诊`、`就诊中`、`住院中`、`已康复`、`慢性病随访` |
+| `order` | 枚举：`asc`、`desc` |
+| `page` | 整数，最小 `1` |
+| `pageSize` | 整数，`1-500`（服务端另有默认值 20） |
+| `ageMonths` / `ageMin` / `ageMax` | 整数，最小 `0` |
+| `min` / `max` | 数值，最小 `0` |
+| `breed` / `sortBy` | 自由文本（`sortBy` 的合法取值来自 `get_meta` 的 `sortFields`） |
+
+枚举取值以运行时 `GET /api/v1/meta` 为准；`get_meta` 工具返回同一份枚举字典。
+
+## 结构化错误
+
+工具内部会捕获 `UpstreamError`，返回 `CallToolResult(isError=True)`，文本内容为固定 JSON 结构：
+
+```json
+{
+  "error": {
+    "code": "UPSTREAM_UNAVAILABLE",
+    "message": "无法连接宠物医院 http://127.0.0.1:8080，请先启动 pethospital.exe",
+    "retryable": false,
+    "status": 503,
+    "detail": "上游错误摘要（已去除 HTML 标签与多余空白）"
+  }
+}
+```
+
+错误码：
+
+| `code` | 触发场景 |
+| --- | --- |
+| `UPSTREAM_UNAVAILABLE` | 无法建立连接，或上游未启动 |
+| `UPSTREAM_TIMEOUT` | 重试后仍请求超时 |
+| `UPSTREAM_HTTP_ERROR` | 上游返回 4xx / 5xx（5xx 会先按配置重试） |
+| `UPSTREAM_BUSINESS_ERROR` | 上游 HTTP 200 但业务 `code != 200` |
+| `UPSTREAM_INVALID_RESPONSE` | 上游响应不是合法 JSON |
+
+`retryable` 表示该错误是否由可重试场景产生，`status` 为上游 HTTP 状态码或业务码（若存在），
+`detail` 只保留清洗后的短摘要，不会把上游 HTML 错误页或 traceback 原样透出。
+
+## 重试、超时与日志
+
+- 超时：`PET_HOSPITAL_TIMEOUT`，默认 10 秒。
+- 重试：仅对**连接超时**与 **HTTP 5xx** 生效，最多 `PET_HOSPITAL_MAX_RETRIES` 次（默认 2），
+  退避为 `PET_HOSPITAL_RETRY_BACKOFF * 2^n`（默认基数 0.15 秒）。
+- 日志：`setup_logging` 在启动时同时挂载文件与 stderr 两个 handler，
+  文件默认 `logs/pet-hospital-mcp.log`，级别取 `MCP_LOG_LEVEL`。
+  每次工具调用记录 `event=start`（工具名 + 入参摘要）、`event=ok`（耗时 + 结果摘要）或
+  `event=upstream_error`（错误码 / 状态 / 耗时 / 原因）；上游重试记录 `upstream retry ...`。
+- 日志使用标准库 `logging`，不使用 `print`。
 
 ## 手动验证（Streamable HTTP，2026-07-28 无状态调用）
 

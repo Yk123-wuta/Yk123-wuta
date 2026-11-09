@@ -186,8 +186,152 @@ async def ask(question: str) -> dict[str, Any]:
     }
 
 
+@mcp.tool()
+async def upload_document(
+    filename: str,
+    content: str,
+    add_to_workspace: bool = True,
+    workspace: str | None = None,
+) -> dict[str, Any]:
+    """Upload a text document to AnythingLLM and embed it into a workspace.
+
+    The document is sent to the AnythingLLM document upload API, then added to
+    the workspace so that its embeddings are generated. The result reports the
+    uploaded document IDs and whether each document is vectorized.
+
+    Args:
+        filename: File name with extension, e.g. "faq.md" or "notes.txt".
+        content: Plain UTF-8 text content of the document.
+        add_to_workspace: When true, the document is added to the workspace and
+            vectorized; when false it is only uploaded to the instance.
+        workspace: Workspace slug that receives the document. Defaults to
+            ANYTHINGLLM_WORKSPACE, or the first workspace in the instance.
+    """
+    if not filename.strip():
+        raise MCPError(-32602, "filename must not be empty.")
+    if not content.strip():
+        raise MCPError(-32602, "content must not be empty.")
+
+    client = _client()
+    slug = None
+    if add_to_workspace:
+        slug = await _resolve_workspace(
+            client, workspace or load_config().workspace_slug
+        )
+
+    uploaded = await client.upload_document(filename.strip(), content.encode("utf-8"))
+    if isinstance(uploaded, dict) and uploaded.get("success") is False:
+        raise MCPError(-32603, f"AnythingLLM upload failed: {uploaded.get('error')}")
+
+    documents = _documents(uploaded)
+    locations = [doc["location"] for doc in documents if doc.get("location")]
+    embedding: Any = None
+    vectorized_locations: set[str] = set()
+    if add_to_workspace and slug:
+        embedding = await client.update_embeddings(slug, adds=locations or None)
+        workspace_documents = await _workspace_documents(client, slug)
+        vectorized_locations = {
+            doc["location"] for doc in workspace_documents if doc.get("vectorized") is True
+        }
+
+    return {
+        "workspace": slug,
+        "uploaded_count": len(documents),
+        "documents": [
+            {
+                "id": doc.get("id"),
+                "title": doc.get("title"),
+                "location": doc.get("location"),
+                "vectorized": doc.get("location") in vectorized_locations,
+            }
+            for doc in documents
+        ],
+        "embedding": (
+            embedding.get("message") if isinstance(embedding, dict) else embedding
+        ),
+    }
+
+
+@mcp.tool()
+async def update_workspace_embeddings(
+    workspace: str | None = None,
+    adds: list[str] | None = None,
+    deletes: list[str] | None = None,
+    reset: bool = False,
+) -> dict[str, Any]:
+    """Add, remove, or reset document embeddings for a workspace.
+
+    Use this to vectorize existing document locations already stored in
+    AnythingLLM, to drop embeddings, or to rebuild all embeddings for the
+    workspace. The result reports the resulting workspace documents and their
+    vectorization status.
+
+    Args:
+        workspace: Workspace slug to update. Defaults to ANYTHINGLLM_WORKSPACE,
+            or the first workspace in the instance.
+        adds: Document locations (e.g. "custom-documents/faq.md-abc.json") to
+            add and vectorize.
+        deletes: Document locations to remove from the workspace embeddings.
+        reset: When true, remove all existing embeddings before applying adds.
+    """
+    if not adds and not deletes and not reset:
+        raise MCPError(
+            -32602, "Provide at least one of adds, deletes, or reset=true."
+        )
+
+    client = _client()
+    slug = await _resolve_workspace(client, workspace or load_config().workspace_slug)
+
+    data = await client.update_embeddings(slug, adds=adds, deletes=deletes, reset=reset)
+    workspace_documents = await _workspace_documents(client, slug)
+    return {
+        "workspace": slug,
+        "message": data.get("message") if isinstance(data, dict) else data,
+        "documents": [
+            {
+                "id": doc.get("id"),
+                "title": doc.get("title"),
+                "location": doc.get("location"),
+                "vectorized": doc.get("vectorized") is True,
+            }
+            for doc in workspace_documents
+        ],
+    }
+
+
+def _documents(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    documents = payload.get("documents")
+    if not isinstance(documents, list):
+        return []
+    return [doc for doc in documents if isinstance(doc, dict)]
+
+
+async def _workspace_documents(
+    client: AnythingLLMClient, slug: str
+) -> list[dict[str, Any]]:
+    data = await client.get_workspace(slug)
+    if not isinstance(data, dict):
+        return []
+    workspaces = data.get("workspace")
+    if not isinstance(workspaces, list) or not workspaces:
+        return []
+    workspace = workspaces[0]
+    if not isinstance(workspace, dict):
+        return []
+    documents = workspace.get("documents")
+    if not isinstance(documents, list):
+        return []
+    return [doc for doc in documents if isinstance(doc, dict)]
+
+
 def main() -> None:
     logging.getLogger("httpx2").setLevel(logging.WARNING)
     logging.getLogger("httpcore2").setLevel(logging.WARNING)
     config = load_config()
     mcp.run(transport="streamable-http", host=config.host, port=config.port)
+
+
+if __name__ == "__main__":
+    main()

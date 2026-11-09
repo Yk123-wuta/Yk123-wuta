@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from dataclasses import replace
@@ -66,9 +67,10 @@ class TestToolResult(unittest.TestCase):
 class TestToolInfo(unittest.TestCase):
     """ToolInfo 元数据完整性。"""
 
-    def test_all_10_tools_have_metadata(self):
+    def test_all_tools_have_metadata(self):
         all_tools = {
-            "get_current_working_directory", "list_directory", "get_file_type",
+            "get_current_working_directory", "get_current_datetime", "is_leap_year",
+            "list_directory", "get_file_type",
             "read_file", "create_file", "write_file", "create_directory",
             "delete_directory", "delete_file", "rename_item", "searchWeb",
             "fetchWeb", "runCli", "loadSkill", "createSkill", "recallContext",
@@ -94,7 +96,7 @@ class TestToolServiceFacade(unittest.TestCase):
 
     def test_list_tools(self):
         tools = ToolService.list_tools()
-        self.assertEqual(len(tools), 16)
+        self.assertEqual(len(tools), 18)
         self.assertTrue(all(isinstance(t, ToolInfo) for t in tools))
 
     def test_get_tool_info(self):
@@ -114,14 +116,21 @@ class TestToolServiceFacade(unittest.TestCase):
 
 
 class TestToolsIndividually(unittest.TestCase):
-    """对 10 个工具逐个调用 ToolService.call()，验证核心逻辑无回归。"""
+    """对 10 个文件类工具逐个调用 ToolService.call()，验证核心逻辑无回归。"""
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
         self.work = Path(self._tmp) / "work"
         self.work.mkdir()
+        # 文件工具默认沙箱根为工作目录，这里把沙箱指向测试临时目录
+        self._old_sandbox = os.environ.get("XAGENT_SANDBOX_ROOT")
+        os.environ["XAGENT_SANDBOX_ROOT"] = self._tmp
 
     def tearDown(self):
+        if self._old_sandbox is None:
+            os.environ.pop("XAGENT_SANDBOX_ROOT", None)
+        else:
+            os.environ["XAGENT_SANDBOX_ROOT"] = self._old_sandbox
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_get_cwd(self):
@@ -247,6 +256,124 @@ class TestToolsIndividually(unittest.TestCase):
         r = ToolService.call("read_file", file_path=str(f))
         self.assertFalse(r.success)
         self.assertIn("二进制", r.error)
+
+
+class TestDateTimeTools(unittest.TestCase):
+    """D2：真实时间工具与闰年判定。"""
+
+    def test_get_current_datetime_returns_real_clock(self):
+        before = time.time()
+        r = ToolService.call("get_current_datetime")
+        after = time.time()
+        self.assertTrue(r.success)
+        self.assertEqual(set(r.data), {
+            "local_datetime", "utc_datetime", "iso_local", "iso_utc",
+            "timezone", "utc_offset_seconds", "weekday", "timestamp",
+        })
+        self.assertIn("当前本地时间", r.message)
+        # 时间戳来自系统真实时钟，而不是硬编码常量
+        self.assertGreaterEqual(r.data["timestamp"], int(before) - 1)
+        self.assertLessEqual(r.data["timestamp"], int(after) + 1)
+        self.assertRegex(r.data["local_datetime"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        self.assertTrue(r.data["iso_utc"].endswith("Z"))
+
+    def test_is_leap_year_rules(self):
+        self.assertTrue(ToolService.call("is_leap_year", year=2024).data["is_leap_year"])
+        self.assertTrue(ToolService.call("is_leap_year", year="2000").data["is_leap_year"])
+        self.assertFalse(ToolService.call("is_leap_year", year=2023).data["is_leap_year"])
+        self.assertFalse(ToolService.call("is_leap_year", year=1900).data["is_leap_year"])
+        self.assertFalse(ToolService.call("is_leap_year", year=2100).data["is_leap_year"])
+        self.assertTrue(ToolService.call("is_leap_year", year=2400).data["is_leap_year"])
+
+    def test_is_leap_year_invalid(self):
+        r = ToolService.call("is_leap_year", year="abc")
+        self.assertFalse(r.success)
+        self.assertIn("整数", r.error)
+        r = ToolService.call("is_leap_year", year="0")
+        self.assertFalse(r.success)
+        self.assertIn("范围", r.error)
+
+    def test_leap_year_message_mentions_rule(self):
+        r = ToolService.call("is_leap_year", year=2024)
+        self.assertIn("闰年", r.message)
+        self.assertIn("400", r.data["rule"])
+
+
+class TestPathSandbox(unittest.TestCase):
+    """D3：文件/目录操作的沙箱边界。"""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.root = Path(self._tmp) / "sandbox"
+        self.root.mkdir()
+        self.outside = Path(self._tmp) / "outside"
+        self.outside.mkdir()
+        (self.outside / "secret.txt").write_text("secret", encoding="utf-8")
+        self._old_sandbox = os.environ.get("XAGENT_SANDBOX_ROOT")
+        os.environ["XAGENT_SANDBOX_ROOT"] = str(self.root)
+
+    def tearDown(self):
+        if self._old_sandbox is None:
+            os.environ.pop("XAGENT_SANDBOX_ROOT", None)
+        else:
+            os.environ["XAGENT_SANDBOX_ROOT"] = self._old_sandbox
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _assert_rejected(self, tool: str, **kwargs):
+        r = ToolService.call(tool, **kwargs)
+        self.assertFalse(r.success)
+        self.assertIn("沙箱", r.error)
+        return r
+
+    def test_absolute_path_outside_rejected(self):
+        target = str(self.outside / "secret.txt")
+        self._assert_rejected("read_file", file_path=target)
+        self._assert_rejected("get_file_type", file_path=target)
+        self._assert_rejected("delete_file", file_path=target)
+        self._assert_rejected("write_file", file_path=target, content="x")
+        self._assert_rejected("list_directory", path=str(self.outside))
+
+    def test_parent_escape_rejected(self):
+        inside = self.root / "sub"
+        inside.mkdir()
+        escape = str(inside / ".." / ".." / "outside" / "secret.txt")
+        self._assert_rejected("read_file", file_path=escape)
+        self._assert_rejected(
+            "create_file", file_path=str(self.root / ".." / "escape.txt")
+        )
+        self.assertFalse((Path(self._tmp) / "escape.txt").exists())
+
+    def test_escape_directory_operations_rejected(self):
+        self._assert_rejected(
+            "create_directory", dir_path=str(self.root / ".." / "evil-dir")
+        )
+        self._assert_rejected(
+            "delete_directory", dir_path=str(self.outside)
+        )
+        self._assert_rejected(
+            "rename_item", source_path=str(self.outside / "secret.txt"),
+            new_name="renamed.txt",
+        )
+
+    def test_inside_operations_still_work(self):
+        f = self.root / "ok.txt"
+        r = ToolService.call("create_file", file_path=str(f), content="hello")
+        self.assertTrue(r.success)
+        self.assertEqual(ToolService.call("read_file", file_path=str(f)).data["content"], "hello")
+        sub = self.root / "nested" / "dir"
+        self.assertTrue(ToolService.call("create_directory", dir_path=str(sub)).success)
+        self.assertTrue(ToolService.call("delete_directory", dir_path=str(sub)).success)
+        self.assertTrue(ToolService.call("delete_file", file_path=str(f)).success)
+
+    def test_symlink_like_relative_inside_allowed(self):
+        """含 .. 但最终仍在沙箱内的路径应放行。"""
+        sub = self.root / "a"
+        sub.mkdir()
+        (sub / "b.txt").write_text("b", encoding="utf-8")
+        inside = str(sub / ".." / "a" / "b.txt")
+        r = ToolService.call("read_file", file_path=inside)
+        self.assertTrue(r.success)
+        self.assertEqual(r.data["content"], "b")
 
 
 class TestCompatibility(unittest.TestCase):
@@ -568,6 +695,8 @@ class TestSkillTools(unittest.TestCase):
         (self.demo / "extra").mkdir()
         (self.demo / "extra" / "guide.md").write_text("extra guide", encoding="utf-8")
         (self.demo / "plain.md").write_text("plain body", encoding="utf-8")
+        # D4：超长正文用于验证截断
+        (self.demo / "big.md").write_text("A" * 13000, encoding="utf-8")
 
         # 缺少 frontmatter 的 Skill 应被忽略
         bad = self.skills_dir / "bad-skill"
@@ -626,6 +755,22 @@ class TestSkillTools(unittest.TestCase):
         )
         self.assertTrue(r.success)
         self.assertEqual(r.data["content"], "plain body")
+
+    def test_load_skill_content_truncated(self):
+        """D4：超长技能正文按上限截断并返回警告。"""
+        r = ToolService.call("loadSkill", name="demo-skill", filename="big.md")
+        self.assertTrue(r.success)
+        self.assertTrue(r.data["truncated"])
+        self.assertEqual(r.data["char_count"], 13000)
+        self.assertLess(len(r.data["content"]), 13000)
+        self.assertIn("已截断", r.data["warning"])
+        self.assertIn("已截断", r.message)
+
+    def test_load_skill_short_content_not_truncated(self):
+        r = ToolService.call("loadSkill", name="demo-skill", filename="plain.md")
+        self.assertTrue(r.success)
+        self.assertFalse(r.data["truncated"])
+        self.assertNotIn("warning", r.data)
 
     def test_load_skill_absolute_path(self):
         target = self.demo / "docs" / "guide.md"

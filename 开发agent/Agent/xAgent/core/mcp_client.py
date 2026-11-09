@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-xAgent.core.mcp_client —— 外部 MCP Server（Streamable HTTP）客户端管理。
+xAgent.core.mcp_client —— 外部 MCP Server（Streamable HTTP / stdio）客户端管理。
 
 职责：
   - 读取当前项目目录下的 .mcp.json，解析 mcpServers 连接信息
-  - 用 MCP Python SDK 建立 Streamable HTTP 会话，调用 list_tools() / call_tool()
+  - 用 MCP Python SDK 建立会话：Streamable HTTP（url）或 stdio（本地子进程管道）
+  - 调用 list_tools() / call_tool()
   - 保存「暴露给 LLM 的工具名 -> (Server, 原始工具名)」映射
   - 单个 Server 连接失败时只记录警告，不影响其它 Server 与本地工具
 
@@ -31,6 +32,7 @@ import anyio
 from .config import load_settings
 
 _SUPPORTED_TRANSPORTS = ("streamable-http", "streamable_http", "http")
+_STDIO_TRANSPORTS = ("stdio",)
 
 
 class MCPClientError(RuntimeError):
@@ -41,11 +43,24 @@ class MCPClientError(RuntimeError):
 
 @dataclass
 class MCPServerConfig:
-    """一个 MCP Server 的连接信息。"""
+    """一个 MCP Server 的连接信息（HTTP 用 url，stdio 用 command/args）。"""
 
     name: str
-    url: str
+    url: str = ""
     headers: Dict[str, str] = field(default_factory=dict)
+    transport: str = "http"
+    command: str = ""
+    args: List[str] = field(default_factory=list)
+    env: Dict[str, str] = field(default_factory=dict)
+    cwd: Optional[str] = None
+
+    @property
+    def target(self) -> str:
+        """供日志与 UI 展示的连接目标。"""
+        if self.transport == "stdio":
+            parts = [self.command, *self.args]
+            return "stdio: " + " ".join(part for part in parts if part)
+        return self.url
 
 
 def load_mcp_config(
@@ -55,7 +70,8 @@ def load_mcp_config(
     读取 <project_root>/.mcp.json。
 
     返回 (配置列表, 警告列表)；文件不存在时返回 ([], [])。
-    仅支持 Streamable HTTP，其它 transport 会被跳过并记录警告。
+    支持 Streamable HTTP（url）与 stdio（command + args）两种传输，
+    其它 transport 会被跳过并记录警告。
     """
     root = Path(project_root or os.getcwd())
     settings = load_settings(str(root))
@@ -81,10 +97,43 @@ def load_mcp_config(
         transport = str(
             conf.get("type") or conf.get("transport") or "streamable-http"
         ).lower()
+
+        # ---------- stdio：本地子进程管道 ----------
+        if transport in _STDIO_TRANSPORTS:
+            command = conf.get("command")
+            if not isinstance(command, str) or not command.strip():
+                warnings.append(f"MCP Server '{name}' 使用 stdio 但缺少 command，已跳过")
+                continue
+            raw_args = conf.get("args")
+            if isinstance(raw_args, (list, tuple)):
+                args = [str(item) for item in raw_args]
+            elif isinstance(raw_args, str):
+                args = [raw_args]
+            else:
+                args = []
+            raw_env = conf.get("env")
+            env = (
+                {str(k): str(v) for k, v in raw_env.items()}
+                if isinstance(raw_env, dict) else {}
+            )
+            cwd = conf.get("cwd")
+            configs.append(
+                MCPServerConfig(
+                    name=str(name),
+                    transport="stdio",
+                    command=command.strip(),
+                    args=args,
+                    env=env,
+                    cwd=str(cwd) if isinstance(cwd, str) and cwd.strip() else None,
+                )
+            )
+            continue
+
+        # ---------- HTTP：Streamable HTTP ----------
         if transport not in _SUPPORTED_TRANSPORTS:
             warnings.append(
                 f"MCP Server '{name}' 使用不支持的传输方式 '{transport}'，"
-                "当前仅支持 Streamable HTTP"
+                "当前支持 Streamable HTTP 与 stdio"
             )
             continue
         url = conf.get("url") or conf.get("httpUrl") or conf.get("http_url")
@@ -99,6 +148,7 @@ def load_mcp_config(
                 name=str(name),
                 url=url.strip(),
                 headers={str(k): str(v) for k, v in headers.items()},
+                transport="http",
             )
         )
     return configs, warnings
@@ -391,7 +441,7 @@ class MCPClientManager:
                 reason = _reason(exc)
                 self._mark_failed(cfg.name, reason, notify="reconnect_failed")
                 self.add_warning(
-                    f"MCP Server '{cfg.name}'（{cfg.url}）连接失败：{reason}，"
+                    f"MCP Server '{cfg.name}'（{cfg.target}）连接失败：{reason}，"
                     "已转入后台自动重连"
                 )
                 self._schedule_reconnect(cfg.name)
@@ -541,19 +591,13 @@ class MCPClientManager:
 
     async def _open_server(self, cfg: MCPServerConfig) -> _ServerState:
         from mcp import ClientSession
-        from mcp.client.streamable_http import (
-            create_mcp_http_client,
-            streamable_http_client,
-        )
 
         stack = AsyncExitStack()
         try:
-            http_client = create_mcp_http_client(headers=cfg.headers or None)
-            await stack.enter_async_context(http_client)
-            streams = await stack.enter_async_context(
-                streamable_http_client(cfg.url, http_client=http_client)
-            )
-            read_stream, write_stream = streams[0], streams[1]
+            if cfg.transport == "stdio":
+                read_stream, write_stream = await self._enter_stdio(stack, cfg)
+            else:
+                read_stream, write_stream = await self._enter_http(stack, cfg)
             session = await stack.enter_async_context(
                 ClientSession(read_stream, write_stream)
             )
@@ -578,6 +622,36 @@ class MCPClientManager:
             reason = _pick_open_error(exc, close_error)
             # 统一转成普通异常，避免 anyio 的取消机制把真实原因覆盖成取消
             raise MCPClientError(_format_error(_as_caller_error(reason))) from None
+
+    @staticmethod
+    async def _enter_http(stack: AsyncExitStack, cfg: MCPServerConfig):
+        """建立 Streamable HTTP 传输，返回 (read_stream, write_stream)。"""
+        from mcp.client.streamable_http import (
+            create_mcp_http_client,
+            streamable_http_client,
+        )
+
+        http_client = create_mcp_http_client(headers=cfg.headers or None)
+        await stack.enter_async_context(http_client)
+        streams = await stack.enter_async_context(
+            streamable_http_client(cfg.url, http_client=http_client)
+        )
+        return streams[0], streams[1]
+
+    @staticmethod
+    async def _enter_stdio(stack: AsyncExitStack, cfg: MCPServerConfig):
+        """建立 stdio 传输：启动本地子进程并绑定 stdin/stdout。"""
+        from mcp import StdioServerParameters
+        from mcp.client.stdio import stdio_client
+
+        params = StdioServerParameters(
+            command=cfg.command,
+            args=list(cfg.args or []),
+            env=cfg.env or None,
+            cwd=cfg.cwd,
+        )
+        streams = await stack.enter_async_context(stdio_client(params))
+        return streams[0], streams[1]
 
     # ---------- 查询 ----------
 
@@ -617,7 +691,8 @@ class MCPClientManager:
                         if status.next_retry_at else 0.0
                 snapshots.append({
                     "name": name,
-                    "url": status.config.url,
+                    "url": status.config.target,
+                    "transport": status.config.transport,
                     "state": status.state,
                     "attempt": status.attempt,
                     "last_error": status.last_error,

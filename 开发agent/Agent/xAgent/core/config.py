@@ -67,6 +67,12 @@ tool_result_limit = 2000
 [session]
 dir = .agents/sessions
 agents_md = AGENTS.md
+; AGENTS.md 注入 System Prompt 的最大字符数，超长截断
+agents_md_max_chars = 8000
+
+[skills]
+; loadSkill 返回单个技能文件的正文上限，超长截断并给出警告
+max_chars = 12000
 
 [mcp]
 config_file = .mcp.json
@@ -76,6 +82,8 @@ call_timeout = 120
 reconnect_delays = 1,2,5,10,30
 
 [tools]
+; 文件/目录工具的沙箱根目录，留空表示当前工作目录（项目根）
+sandbox_root =
 search_top_k = 10
 search_timeout = 60
 fetch_timeout = 30
@@ -84,6 +92,13 @@ fetch_max_chars = 20000
 cli_timeout = 30
 cli_max_timeout = 120
 cli_max_output_chars = 8000
+
+[logging]
+; 工具调用日志：与 TUI 展示分离，按天写入 JSONL
+enabled = true
+dir = .agents/logs
+arg_chars = 200
+result_chars = 400
 
 [ui]
 sidebar_width = 40
@@ -144,6 +159,10 @@ class Settings:
     # 会话
     session_dir: str = ".agents/sessions"
     agents_md_file: str = "AGENTS.md"
+    agents_md_max_chars: int = 8000
+
+    # Skill
+    skill_max_chars: int = 12000
 
     # MCP
     mcp_config_file: str = ".mcp.json"
@@ -152,6 +171,7 @@ class Settings:
     mcp_reconnect_delays: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
 
     # 工具
+    sandbox_root: str = ""
     search_top_k: int = 10
     search_timeout: float = 60.0
     fetch_timeout: float = 30.0
@@ -160,6 +180,12 @@ class Settings:
     cli_timeout: int = 30
     cli_max_timeout: int = 120
     cli_max_output_chars: int = 8000
+
+    # 日志
+    log_enabled: bool = True
+    log_dir: str = ".agents/logs"
+    log_arg_chars: int = 200
+    log_result_chars: int = 400
 
     # 界面
     sidebar_width: int = 40
@@ -214,6 +240,43 @@ def _get_float_list(
     return values or default
 
 
+def _get_bool(parser, section: str, option: str, default: bool) -> bool:
+    raw = _get(parser, section, option, "true" if default else "false").lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def read_agents_md(
+    root: str | Path | None = None,
+    filename: str | None = None,
+    max_chars: int | None = None,
+) -> str:
+    """
+    读取项目根目录下的 AGENTS.md（或配置指定的等价文件名）。
+
+    缺失、不可读或内容为空时返回空字符串（不报错）；超过 max_chars 时
+    截断并追加提示，避免超长规则文件占满 System Prompt。
+    """
+    settings = load_settings(root)
+    path = Path(root or os.getcwd()).resolve() / (filename or settings.agents_md_file)
+    if not path.is_file():
+        return ""
+    try:
+        content = path.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return ""
+    if not content:
+        return ""
+
+    limit = settings.agents_md_max_chars if max_chars is None else max_chars
+    if limit > 0 and len(content) > limit:
+        original = len(content)
+        content = (
+            content[:limit]
+            + f"\n\n…（AGENTS.md 过长已截断，原 {original} 字符，仅保留前 {limit} 字符）"
+        )
+    return content
+
+
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, "").strip() or default
 
@@ -240,6 +303,15 @@ def load_settings(root: str | Path | None = None) -> Settings:
     )
     # 旧版 [qianfan] 配置有 Key 时默认按真实接口处理
     default_provider = "qianfan" if legacy_key else "mock"
+
+    # 日志开关：环境变量优先，其次 config.ini，最后默认开启
+    log_env = _env("XAGENT_LOG_ENABLED", "").lower()
+    if log_env in ("1", "true", "yes", "on"):
+        log_enabled = True
+    elif log_env in ("0", "false", "no", "off"):
+        log_enabled = False
+    else:
+        log_enabled = _get_bool(parser, "logging", "enabled", True)
 
     return Settings(
         config_path=path,
@@ -284,7 +356,14 @@ def load_settings(root: str | Path | None = None) -> Settings:
         recall_total_chars=_get_int(parser, "context", "recall_total_chars", 6000),
         tool_result_limit=_get_int(parser, "context", "tool_result_limit", 2000),
         session_dir=_get(parser, "session", "dir", ".agents/sessions"),
-        agents_md_file=_get(parser, "session", "agents_md", "AGENTS.md"),
+        agents_md_file=_env(
+            "XAGENT_AGENTS_MD",
+            _get(parser, "session", "agents_md", "AGENTS.md"),
+        ),
+        agents_md_max_chars=_get_int(
+            parser, "session", "agents_md_max_chars", 8000
+        ),
+        skill_max_chars=_get_int(parser, "skills", "max_chars", 12000),
         mcp_config_file=_env(
             "XAGENT_MCP_CONFIG",
             _get(parser, "mcp", "config_file", ".mcp.json"),
@@ -293,6 +372,10 @@ def load_settings(root: str | Path | None = None) -> Settings:
         mcp_call_timeout=_get_float(parser, "mcp", "call_timeout", 120.0),
         mcp_reconnect_delays=_get_float_list(
             parser, "mcp", "reconnect_delays", (1.0, 2.0, 5.0, 10.0, 30.0)
+        ),
+        sandbox_root=_env(
+            "XAGENT_SANDBOX_ROOT",
+            _get(parser, "tools", "sandbox_root", ""),
         ),
         search_top_k=_get_int(parser, "tools", "search_top_k", 10),
         search_timeout=_get_float(parser, "tools", "search_timeout", 60.0),
@@ -306,5 +389,11 @@ def load_settings(root: str | Path | None = None) -> Settings:
         cli_max_output_chars=_get_int(
             parser, "tools", "cli_max_output_chars", 8000
         ),
+        log_enabled=log_enabled,
+        log_dir=_env(
+            "XAGENT_LOG_DIR", _get(parser, "logging", "dir", ".agents/logs")
+        ),
+        log_arg_chars=_get_int(parser, "logging", "arg_chars", 200),
+        log_result_chars=_get_int(parser, "logging", "result_chars", 400),
         sidebar_width=_get_int(parser, "ui", "sidebar_width", 40),
     )

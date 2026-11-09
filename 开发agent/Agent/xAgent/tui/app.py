@@ -55,7 +55,9 @@ from xAgent.core.context import (
 from xAgent.core.skills import (
     build_skill_prompt, discover_skills, get_skill_registry,
 )
-from xAgent.core.config import ensure_config_file, load_settings
+from xAgent.core.config import (
+    ensure_config_file, load_settings, read_agents_md,
+)
 from xAgent.core.llm import (
     LLMMessage, ToolCall, MockProvider, OpenAICompatibleProvider,
 )
@@ -1332,13 +1334,7 @@ class XAgentApp(App):
         if self._agents_injected:
             return
         self._agents_injected = True
-        path = self._store.root / load_settings().agents_md_file
-        if not path.is_file():
-            return
-        try:
-            content = path.read_text(encoding="utf-8", errors="ignore").strip()
-        except OSError:
-            return
+        content = read_agents_md(self._store.root)
         if not content:
             return
         message = LLMMessage(

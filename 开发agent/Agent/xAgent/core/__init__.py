@@ -8,6 +8,8 @@ xAgent.core —— 核心逻辑层，零 UI 依赖。
 from .types import ToolResult, ToolInfo
 from .tools import (
     get_current_working_directory,
+    get_current_datetime,
+    is_leap_year,
     list_directory,
     get_file_type,
     read_file,
@@ -38,6 +40,8 @@ __all__ = [
     "ToolInfo",
     # 工具函数
     "get_current_working_directory",
+    "get_current_datetime",
+    "is_leap_year",
     "list_directory",
     "get_file_type",
     "read_file",

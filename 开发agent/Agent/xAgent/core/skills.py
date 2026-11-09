@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .config import load_settings
+
 SKILL_FILE_NAME = "SKILL.md"
 SKILLS_REL_DIR = (".agents", "skills")
 
@@ -444,18 +446,41 @@ def load_skill(name: str, filename: Optional[str] = None) -> dict:
             "file_path": str(target),
         }
 
-    return {
+    # 正文长度上限：超长内容截断，避免一次性塞满 System Prompt / 上下文
+    try:
+        limit = max(0, int(load_settings().skill_max_chars))
+    except Exception:
+        limit = 12000
+    original_chars = len(content)
+    truncated = bool(limit) and original_chars > limit
+    warning = ""
+    if truncated:
+        content = (
+            content[:limit]
+            + f"\n\n…（技能内容过长已截断，原 {original_chars} 字符，"
+            f"仅保留前 {limit} 字符）"
+        )
+        warning = (
+            f"技能文件超过 {limit} 字符上限，已截断（原 {original_chars} 字符）"
+        )
+
+    result = {
         "success": True,
         "name": skill.name,
         "file_path": str(target),
         "relative_path": _relative_display(target, skill.directory),
         "content": content,
-        "char_count": len(content),
+        "char_count": original_chars,
+        "truncated": truncated,
         "message": (
             f"已加载 Skill '{skill.name}' 的文件："
             f"{_relative_display(target, skill.directory)}"
         ),
     }
+    if warning:
+        result["warning"] = warning
+        result["message"] += f"；{warning}"
+    return result
 
 
 # ============================================================

@@ -2,55 +2,263 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AnythingLLM 文档上传</title>
 <style>
-  body { font-family: sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
-  #log { white-space: pre-wrap; background: #f5f5f5; padding: 12px; margin-top: 16px;
-         border-radius: 6px; min-height: 60px; font-size: 13px; }
-  .ok { color: #0a7d2c; } .err { color: #c00; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 16px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    color: #1f2328;
+    background: #f3f5f8;
+  }
+  .card {
+    width: 100%;
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 24px;
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, .08);
+  }
+  h1 { margin: 0 0 8px; font-size: 1.25rem; }
+  .hint { margin: 0 0 20px; color: #59636e; font-size: .875rem; }
+  .field { margin-bottom: 16px; }
+  label { display: block; margin-bottom: 6px; font-size: .875rem; font-weight: 600; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  select, input[type="file"] {
+    width: 100%;
+    min-width: 0;
+    padding: 10px 12px;
+    font-size: .9375rem;
+    border: 1px solid #d1d9e0;
+    border-radius: 8px;
+    background: #fff;
+  }
+  select { flex: 1 1 240px; }
+  button {
+    width: 100%;
+    padding: 11px 16px;
+    font-size: .9375rem;
+    border: 0;
+    border-radius: 8px;
+    color: #fff;
+    background: #1f6feb;
+    cursor: pointer;
+  }
+  button:disabled { background: #b6c2cf; cursor: not-allowed; }
+  button.ghost {
+    flex: 0 0 auto;
+    width: auto;
+    color: #1f6feb;
+    background: #eaf1fd;
+  }
+  .status {
+    margin: 18px 0 0;
+    font-size: .875rem;
+    color: #59636e;
+  }
+  .status[data-state="ok"] { color: #0a7d2c; }
+  .status[data-state="err"] { color: #c00; }
+  .detail {
+    margin: 12px 0 0;
+    padding: 12px;
+    max-height: 260px;
+    overflow: auto;
+    font-size: .75rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-all;
+    background: #f6f8fa;
+    border-radius: 8px;
+  }
+  @media (max-width: 480px) {
+    body { padding: 12px 10px; }
+    .card { padding: 18px 14px; }
+    button.ghost { width: 100%; }
+  }
 </style>
 </head>
 <body>
-<h2>上传文档到工作区「text」并向量化</h2>
-<input type="file" id="file">
-<button id="btn">上传并向量化</button>
-<div id="log">等待上传…</div>
+<main class="card">
+  <h1>上传文档到 AnythingLLM 工作区</h1>
+  <p class="hint">选择工作区并上传文档，服务端会完成向量化处理。</p>
+
+  <div class="field">
+    <label for="workspace">工作区</label>
+    <div class="row">
+      <select id="workspace" disabled>
+        <option>正在加载工作区…</option>
+      </select>
+      <button type="button" class="ghost" id="reload" disabled>刷新</button>
+    </div>
+  </div>
+
+  <div class="field">
+    <label for="file">文档</label>
+    <input type="file" id="file">
+  </div>
+
+  <button type="button" id="btn" disabled>上传并向量化</button>
+  <p class="status" id="status" role="status" aria-live="polite">等待操作…</p>
+  <pre class="detail" id="detail" hidden></pre>
+</main>
 
 <script>
-const API = "http://localhost:3001/api/v1/document/upload";
-const KEY = "5C047SP-FMBMN3F-MJTYNAQ-W1EK4X1";
-const WORKSPACE = "text";
-const log = (msg, cls) => {
-  const el = document.getElementById("log");
-  el.className = cls || "";
-  el.textContent = msg;
+// 浏览器只请求同源代理接口，不接触 AnythingLLM 地址与 API Key。
+const ENDPOINT_WORKSPACES = "/api/workspaces";
+const ENDPOINT_UPLOAD = "/api/upload";
+
+const el = {
+  workspace: document.getElementById("workspace"),
+  reload: document.getElementById("reload"),
+  file: document.getElementById("file"),
+  btn: document.getElementById("btn"),
+  status: document.getElementById("status"),
+  detail: document.getElementById("detail")
 };
+let uploading = false;
 
-document.getElementById("btn").onclick = async () => {
-  const file = document.getElementById("file").files[0];
-  if (!file) return log("请先选择一个文件", "err");
+// 所有动态内容都通过 textContent 写入，不拼接 HTML，杜绝 XSS。
+function setStatus(text, state) {
+  el.status.textContent = text;
+  if (state) el.status.dataset.state = state;
+  else el.status.removeAttribute("data-state");
+}
 
-  const fd = new FormData();
-  fd.append("file", file);
-  fd.append("addToWorkspaces", WORKSPACE);
+function setDetail(data) {
+  if (data === null || data === undefined || data === "") {
+    el.detail.hidden = true;
+    el.detail.textContent = "";
+    return;
+  }
+  el.detail.hidden = false;
+  el.detail.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+}
 
-  log("上传中：" + file.name + " …");
+async function readBody(res) {
+  const text = await res.text();
+  if (!text) return {};
+  try { return JSON.parse(text); } catch (e) { return { raw: text }; }
+}
+
+function setBusy(busy) {
+  uploading = busy;
+  el.btn.disabled = busy || !el.workspace.value;
+  el.file.disabled = busy;
+  el.workspace.disabled = busy || el.workspace.options.length === 0;
+  el.reload.disabled = busy;
+}
+
+function normalizeWorkspaces(data) {
+  if (Array.isArray(data)) return data;
+  if (data && Array.isArray(data.workspaces)) return data.workspaces;
+  if (data && data.workspace) return [data.workspace];
+  return [];
+}
+
+function renderWorkspaces(items) {
+  el.workspace.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("option");
+    empty.textContent = "无可用工作区";
+    empty.value = "";
+    el.workspace.append(empty);
+    el.workspace.disabled = true;
+    el.btn.disabled = true;
+    return;
+  }
+  for (const item of items) {
+    const slug = String(item.slug || item.id || item.name || "");
+    if (!slug) continue;
+    const option = document.createElement("option");
+    option.value = slug;
+    option.textContent = String(item.name || slug);
+    el.workspace.append(option);
+  }
+  el.workspace.disabled = uploading;
+  el.btn.disabled = uploading || !el.workspace.value;
+}
+
+async function loadWorkspaces() {
+  el.workspace.disabled = true;
+  el.reload.disabled = true;
+  el.btn.disabled = true;
+  el.workspace.replaceChildren();
+  const loading = document.createElement("option");
+  loading.textContent = "正在加载工作区…";
+  el.workspace.append(loading);
+  setDetail(null);
+  setStatus("正在加载工作区…");
+
   try {
-    const res = await fetch(API, {
-      method: "POST",
-      headers: { Authorization: "Bearer " + KEY },
-      body: fd
-    });
-    const data = await res.json();
-    if (res.ok && data.success) {
-      log("上传成功并已加入工作区「" + WORKSPACE + "」\n\n" + JSON.stringify(data, null, 2), "ok");
+    const res = await fetch(ENDPOINT_WORKSPACES, { headers: { Accept: "application/json" } });
+    const data = await readBody(res);
+    if (!res.ok) {
+      throw new Error(data.error || data.raw || ("HTTP " + res.status));
+    }
+    const items = normalizeWorkspaces(data);
+    renderWorkspaces(items);
+    if (items.length) {
+      setStatus("已加载 " + items.length + " 个工作区，请选择后上传。", "ok");
     } else {
-      log("失败 (" + res.status + ")\n\n" + JSON.stringify(data, null, 2), "err");
+      setStatus("未获取到工作区，请先在 AnythingLLM 中创建工作区。", "err");
+      setDetail(data);
     }
   } catch (e) {
-    log("请求错误：" + e.message, "err");
+    el.workspace.replaceChildren();
+    const failed = document.createElement("option");
+    failed.textContent = "加载失败";
+    failed.value = "";
+    el.workspace.append(failed);
+    el.workspace.disabled = true;
+    el.btn.disabled = true;
+    setStatus("加载工作区失败：" + e.message, "err");
+  } finally {
+    el.reload.disabled = false;
   }
-};
+}
+
+async function upload() {
+  const file = el.file.files[0];
+  const workspace = el.workspace.value;
+  if (!workspace) return setStatus("请先选择工作区", "err");
+  if (!file) return setStatus("请先选择一个文件", "err");
+
+  const form = new FormData();
+  form.append("file", file);
+  form.append("addToWorkspaces", workspace);
+
+  setBusy(true);
+  setDetail(null);
+  setStatus("上传中：" + file.name + " …");
+
+  try {
+    const res = await fetch(ENDPOINT_UPLOAD, { method: "POST", body: form });
+    const data = await readBody(res);
+    if (res.ok && data.success) {
+      setStatus("上传成功，已加入工作区「" + workspace + "」", "ok");
+      setDetail(data);
+    } else {
+      setStatus("上传失败 (" + res.status + ")：" + (data.error || "请查看详情"), "err");
+      setDetail(data);
+    }
+  } catch (e) {
+    setStatus("请求错误：" + e.message, "err");
+  } finally {
+    setBusy(false);
+    el.btn.disabled = !el.workspace.value;
+    el.file.disabled = false;
+  }
+}
+
+el.reload.addEventListener("click", loadWorkspaces);
+el.workspace.addEventListener("change", () => {
+  el.btn.disabled = uploading || !el.workspace.value;
+});
+el.btn.addEventListener("click", upload);
+loadWorkspaces();
 </script>
 </body>
 </html>

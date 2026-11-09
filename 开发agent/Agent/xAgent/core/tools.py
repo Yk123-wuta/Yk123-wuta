@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-xAgent.core.tools —— 13 个纯函数式工具（10 个文件操作 + 联网搜索 + 网页正文提取 + CLI 执行）。
+xAgent.core.tools —— 纯函数式工具（文件操作 + 时间/闰年 + 联网搜索 + 网页正文提取 + CLI 执行）。
 
 设计原则：
-  1. 只依赖标准库（os / pathlib / shutil / mimetypes / json / subprocess / shlex / urllib）
+  1. 只依赖标准库（os / pathlib / shutil / mimetypes / json / subprocess / shlex / urllib / datetime）
      联网能力：curl（系统命令）+ trafilatura（第三方，可选依赖，缺失时给出明确提示）
   2. 不 import 任何 UI 相关模块
   3. 只做一件事：接收参数 -> 执行操作 -> 返回 dict
      （registry 层会把 dict 包成 ToolResult）
   4. 错误处理统一返回 {"success": False, "error": "..."}，不抛异常到上层
+  5. 所有文件/目录操作都限制在配置的沙箱根目录内，越界路径直接拒绝
 """
 
 import json
@@ -20,9 +21,67 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import load_settings
+
+
+# ============ 路径沙箱 ============
+
+def _sandbox_root() -> Path:
+    """当前配置的沙箱根目录；未配置时使用进程工作目录。"""
+    try:
+        configured = load_settings().sandbox_root
+    except Exception:
+        configured = ""
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path(os.getcwd()).resolve()
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    """判断 path 是否位于 root 内（大小写不敏感，兼容不同盘符）。"""
+    try:
+        return os.path.commonpath([
+            os.path.normcase(str(path)), os.path.normcase(str(root)),
+        ]) == os.path.normcase(str(root))
+    except ValueError:
+        return False
+
+
+def _sandbox_error(raw_path: str, root: Path) -> dict:
+    return {
+        "success": False,
+        "error": (
+            f"路径越界：{raw_path} 不在允许的沙箱根目录内（{root}），"
+            "已拒绝执行文件操作"
+        ),
+        "sandbox_root": str(root),
+    }
+
+
+def _resolve_in_sandbox(raw_path: str) -> tuple[Path | None, dict | None]:
+    """解析路径并校验沙箱边界；越界或无法解析时返回错误 dict。"""
+    root = _sandbox_root()
+    try:
+        resolved = Path(str(raw_path)).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, {
+            "success": False,
+            "error": f"路径解析失败：{raw_path}（{exc}）",
+        }
+    if not _is_within(resolved, root):
+        return None, _sandbox_error(raw_path, root)
+    return resolved, None
+
+
+def _raw_resolve(raw_path: str) -> Path | None:
+    """仅解析路径，不做沙箱校验（用于删除目录前的工作目录保护判断）。"""
+    try:
+        return Path(str(raw_path)).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 # ============ 1. get_current_working_directory ============
@@ -40,12 +99,85 @@ def get_current_working_directory() -> dict:
         return {"success": False, "error": str(e)}
 
 
-# ============ 2. list_directory ============
+# ============ 2. get_current_datetime ============
+
+def get_current_datetime() -> dict:
+    """获取当前日期时间（本地时间 + UTC，跨平台，非硬编码）。"""
+    try:
+        local = datetime.now().astimezone()
+        utc = datetime.now(timezone.utc)
+        offset = local.utcoffset()
+        offset_seconds = int(offset.total_seconds()) if offset else 0
+        return {
+            "success": True,
+            "local_datetime": local.strftime("%Y-%m-%d %H:%M:%S"),
+            "utc_datetime": utc.strftime("%Y-%m-%d %H:%M:%S"),
+            "iso_local": local.isoformat(timespec="seconds"),
+            "iso_utc": utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "timezone": local.tzname() or "本地时区",
+            "utc_offset_seconds": offset_seconds,
+            "weekday": local.strftime("%A"),
+            "timestamp": int(time.time()),
+            "message": (
+                f"当前本地时间: {local.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"({local.tzname() or '本地时区'})，UTC 时间: "
+                f"{utc.strftime('%Y-%m-%d %H:%M:%S')}"
+            ),
+        }
+    except Exception as exc:
+        return {"success": False, "error": f"获取当前时间失败：{exc}"}
+
+
+# ============ 3. is_leap_year ============
+
+def is_leap_year(year) -> dict:
+    """
+    判断指定年份是否为闰年。
+
+    规则：能被 4 整除且不能被 100 整除，或能被 400 整除。
+    """
+    try:
+        value = int(year)
+    except (TypeError, ValueError):
+        return {"success": False, "error": f"年份必须是整数：{year}"}
+
+    if value < 1 or value > 9999:
+        return {
+            "success": False,
+            "error": f"年份超出范围（1-9999）：{value}",
+        }
+
+    by_4 = value % 4 == 0
+    by_100 = value % 100 == 0
+    by_400 = value % 400 == 0
+    leap = by_4 and (not by_100 or by_400)
+
+    if leap:
+        reason = (
+            f"能被 400 整除" if by_400
+            else "能被 4 整除且不能被 100 整除"
+        )
+    else:
+        reason = "能被 100 整除但不能被 400 整除" if by_100 else "不能被 4 整除"
+
+    return {
+        "success": True,
+        "year": value,
+        "is_leap_year": leap,
+        "rule": "能被 4 整除且不能被 100 整除，或能被 400 整除",
+        "reason": reason,
+        "message": f"{value} 年{'是' if leap else '不是'}闰年（{reason}）",
+    }
+
+
+# ============ 4. list_directory ============
 
 def list_directory(path: str = ".") -> dict:
     """列出指定目录下所有文件和子目录。"""
     try:
-        target = Path(path).resolve()
+        target, error = _resolve_in_sandbox(path)
+        if error:
+            return error
 
         if not target.exists():
             return {"success": False, "error": f"路径不存在: {path}"}
@@ -79,7 +211,9 @@ def list_directory(path: str = ".") -> dict:
 def get_file_type(file_path: str) -> dict:
     """获取指定文件的文件类型。"""
     try:
-        path = Path(file_path).resolve()
+        path, error = _resolve_in_sandbox(file_path)
+        if error:
+            return error
 
         if not path.exists():
             return {"success": False, "error": f"文件不存在: {file_path}"}
@@ -125,7 +259,9 @@ def get_file_type(file_path: str) -> dict:
 def read_file(file_path: str) -> dict:
     """读取文件内容（仅支持纯文本格式文件）。"""
     try:
-        path = Path(file_path).resolve()
+        path, error = _resolve_in_sandbox(file_path)
+        if error:
+            return error
 
         if not path.exists():
             return {"success": False, "error": f"文件不存在: {file_path}"}
@@ -181,7 +317,9 @@ def read_file(file_path: str) -> dict:
 def create_file(file_path: str, content: str = "") -> dict:
     """创建新文件（自动创建父目录链）。"""
     try:
-        path = Path(file_path)
+        path, error = _resolve_in_sandbox(file_path)
+        if error:
+            return error
 
         if path.parent != Path('.') and not path.parent.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,7 +345,9 @@ def create_file(file_path: str, content: str = "") -> dict:
 def write_file(file_path: str, content: str, mode: str = "overwrite") -> dict:
     """编辑文件内容（overwrite / append）。"""
     try:
-        path = Path(file_path).resolve()
+        path, error = _resolve_in_sandbox(file_path)
+        if error:
+            return error
 
         if not path.exists():
             return {"success": False, "error": f"文件不存在: {file_path}"}
@@ -241,7 +381,9 @@ def write_file(file_path: str, content: str, mode: str = "overwrite") -> dict:
 def create_directory(dir_path: str) -> dict:
     """创建新目录（支持级联创建）。"""
     try:
-        path = Path(dir_path).resolve()
+        path, error = _resolve_in_sandbox(dir_path)
+        if error:
+            return error
 
         if path.exists():
             if path.is_dir():
@@ -270,18 +412,23 @@ def create_directory(dir_path: str) -> dict:
 def delete_directory(dir_path: str, force: bool = True) -> dict:
     """删除目录（force=True 可删除非空目录）。"""
     try:
-        path = Path(dir_path).resolve()
+        # 工作目录保护优先于沙箱校验，保持原有错误语义
+        raw = _raw_resolve(dir_path)
+        if raw is not None:
+            cwd = Path(os.getcwd()).resolve()
+            if raw == cwd:
+                return {"success": False, "error": "不能删除当前工作目录"}
+            if raw in cwd.parents:
+                return {"success": False, "error": "不能删除当前工作目录的上级目录"}
+
+        path, error = _resolve_in_sandbox(dir_path)
+        if error:
+            return error
 
         if not path.exists():
             return {"success": False, "error": f"目录不存在: {dir_path}"}
         if not path.is_dir():
             return {"success": False, "error": f"不是目录: {dir_path}"}
-
-        cwd = Path(os.getcwd()).resolve()
-        if path == cwd:
-            return {"success": False, "error": "不能删除当前工作目录"}
-        if path in cwd.parents:
-            return {"success": False, "error": "不能删除当前工作目录的上级目录"}
 
         has_contents = any(path.iterdir())
 
@@ -313,7 +460,9 @@ def delete_directory(dir_path: str, force: bool = True) -> dict:
 def delete_file(file_path: str) -> dict:
     """删除文件。"""
     try:
-        path = Path(file_path).resolve()
+        path, error = _resolve_in_sandbox(file_path)
+        if error:
+            return error
 
         if not path.exists():
             return {"success": False, "error": f"文件不存在: {file_path}"}
@@ -340,7 +489,9 @@ def delete_file(file_path: str) -> dict:
 def rename_item(source_path: str, new_name: str) -> dict:
     """重命名文件或目录（保守拒绝覆盖）。"""
     try:
-        source = Path(source_path).resolve()
+        source, error = _resolve_in_sandbox(source_path)
+        if error:
+            return error
 
         if not source.exists():
             return {"success": False, "error": f"源路径不存在: {source_path}"}

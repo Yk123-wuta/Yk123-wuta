@@ -15,6 +15,17 @@ class Config:
         ).rstrip("/")
         self.http_host = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
         self.http_port = int(os.environ.get("MCP_HTTP_PORT", "8301"))
+        self.upstream_timeout = float(os.environ.get("PET_HOSPITAL_TIMEOUT", "10"))
+        self.upstream_max_retries = int(
+            os.environ.get("PET_HOSPITAL_MAX_RETRIES", "2")
+        )
+        self.upstream_retry_backoff = float(
+            os.environ.get("PET_HOSPITAL_RETRY_BACKOFF", "0.15")
+        )
+        self.log_file = os.environ.get(
+            "MCP_LOG_FILE", os.path.join("logs", "pet-hospital-mcp.log")
+        )
+        self.log_level = os.environ.get("MCP_LOG_LEVEL", "INFO").upper()
 
 
 config = Config()

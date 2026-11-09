@@ -73,3 +73,37 @@ class AnythingLLMClient:
 
     async def delete_workspace(self, slug: str) -> Any:
         return await self.delete(f"/v1/workspace/{quote(slug, safe='')}")
+
+    async def upload_document(
+        self,
+        filename: str,
+        content: bytes,
+        add_to_workspaces: list[str] | None = None,
+    ) -> Any:
+        data: dict[str, str] = {}
+        if add_to_workspaces:
+            data["addToWorkspaces"] = ",".join(add_to_workspaces)
+        return await self.post(
+            "/v1/document/upload",
+            files={"file": (filename, content)},
+            data=data,
+        )
+
+    async def update_embeddings(
+        self,
+        slug: str,
+        adds: list[str] | None = None,
+        deletes: list[str] | None = None,
+        reset: bool = False,
+    ) -> Any:
+        payload: dict[str, Any] = {}
+        if adds:
+            payload["adds"] = adds
+        if deletes:
+            payload["deletes"] = deletes
+        if reset:
+            payload["reset"] = True
+        return await self.post(
+            f"/v1/workspace/{quote(slug, safe='')}/update-embeddings",
+            json=payload,
+        )

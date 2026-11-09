@@ -102,3 +102,45 @@ async def test_request_returns_text_on_non_json():
     with _patch_client(http):
         result = await AnythingLLMClient("http://x/api", "key").list_workspaces()
     assert result == "plain text"
+
+
+async def test_upload_document_posts_multipart_file():
+    http = _mock_http({"success": True, "documents": [{"id": "doc-1"}]})
+    with _patch_client(http):
+        await AnythingLLMClient("http://x/api", "key").upload_document(
+            "faq.md", b"hello", ["my ws"]
+        )
+    method, url = http.request.await_args.args[:2]
+    assert method == "POST"
+    assert url == "http://x/api/v1/document/upload"
+    assert http.request.await_args.kwargs["files"] == {"file": ("faq.md", b"hello")}
+    assert http.request.await_args.kwargs["data"] == {"addToWorkspaces": "my ws"}
+
+
+async def test_upload_document_without_workspace_omits_form_field():
+    http = _mock_http({"success": True, "documents": []})
+    with _patch_client(http):
+        await AnythingLLMClient("http://x/api", "key").upload_document("faq.md", b"hello")
+    assert http.request.await_args.kwargs["data"] == {}
+
+
+async def test_update_embeddings_posts_adds_and_deletes():
+    http = _mock_http({"message": "Workspace updated."})
+    with _patch_client(http):
+        await AnythingLLMClient("http://x/api", "key").update_embeddings(
+            "my ws", adds=["custom-documents/a.json"], deletes=["custom-documents/b.json"]
+        )
+    method, url = http.request.await_args.args[:2]
+    assert method == "POST"
+    assert url == "http://x/api/v1/workspace/my%20ws/update-embeddings"
+    assert http.request.await_args.kwargs["json"] == {
+        "adds": ["custom-documents/a.json"],
+        "deletes": ["custom-documents/b.json"],
+    }
+
+
+async def test_update_embeddings_reset_only():
+    http = _mock_http({"message": "reset"})
+    with _patch_client(http):
+        await AnythingLLMClient("http://x/api", "key").update_embeddings("kb", reset=True)
+    assert http.request.await_args.kwargs["json"] == {"reset": True}
