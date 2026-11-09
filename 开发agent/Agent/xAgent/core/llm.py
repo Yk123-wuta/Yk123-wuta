@@ -35,6 +35,7 @@ class LLMMessage:
     content: str = ""
     tool_calls: Optional[List[ToolCall]] = None      # assistant 消息带工具请求
     tool_call_id: Optional[str] = None               # tool 消息关联哪个请求
+    usage: Optional[Dict[str, int]] = None           # 模型返回的 token 用量
 
 
 # ---------- Provider 接口 ----------
@@ -305,9 +306,11 @@ class OpenAICompatibleProvider:
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": [_to_api_msg(m) for m in messages],
-            "tools": tools_schema,
-            "tool_choice": "auto",
         }
+        # 上下文压缩等场景不需要工具，避免部分接口拒绝空 tools 数组
+        if tools_schema:
+            payload["tools"] = tools_schema
+            payload["tool_choice"] = "auto"
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
         req = urllib.request.Request(url, data=data, headers=headers)
@@ -331,10 +334,18 @@ class OpenAICompatibleProvider:
                 )
                 for tc in choice["tool_calls"]
             ]
+        usage = body.get("usage") if isinstance(body.get("usage"), dict) else None
+        if usage:
+            usage = {
+                str(k): int(v)
+                for k, v in usage.items()
+                if isinstance(v, (int, float))
+            }
         return LLMMessage(
             role="assistant",
             content=choice.get("content") or "",
             tool_calls=tool_calls,
+            usage=usage,
         )
 
 

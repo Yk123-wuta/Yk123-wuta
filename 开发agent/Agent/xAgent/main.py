@@ -27,8 +27,9 @@ from xAgent.core import ToolService, call_tool
 # ---------- 子命令实现 ----------
 
 def cmd_list() -> int:
-    from xAgent.core.registry import get_mcp_warnings
+    from xAgent.core.registry import ensure_mcp_tools, get_mcp_warnings
 
+    ensure_mcp_tools()
     for t in ToolService.list_tools():
         print(f"  {t.name}")
         print(f"    {t.description}")
@@ -116,8 +117,14 @@ def cmd_demo() -> int:
 
 
 def cmd_tui() -> int:
+    from xAgent.core.config import ensure_config_file
     from xAgent.tui import FileOpsApp
-    FileOpsApp().run()
+
+    path, created = ensure_config_file()
+    if created:
+        print(f"已创建配置文件：{path}")
+        print("当前使用 Mock 信息，修改配置后重新启动 xAgent 才能正常工作。")
+    FileOpsApp(config_created=created, config_path=str(path)).run()
     return 0
 
 

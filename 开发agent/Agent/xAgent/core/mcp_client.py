@@ -20,16 +20,15 @@ import concurrent.futures
 import json
 import os
 import threading
+import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import anyio
 
-MCP_CONFIG_FILE = ".mcp.json"
-CONNECT_TIMEOUT = 15.0
-CALL_TIMEOUT = 120.0
+from .config import load_settings
 
 _SUPPORTED_TRANSPORTS = ("streamable-http", "streamable_http", "http")
 
@@ -59,7 +58,8 @@ def load_mcp_config(
     仅支持 Streamable HTTP，其它 transport 会被跳过并记录警告。
     """
     root = Path(project_root or os.getcwd())
-    path = root / MCP_CONFIG_FILE
+    settings = load_settings(str(root))
+    path = root / settings.mcp_config_file
     warnings: List[str] = []
     if not path.is_file():
         return [], warnings
@@ -67,11 +67,11 @@ def load_mcp_config(
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
-        return [], [f"读取 {MCP_CONFIG_FILE} 失败：{exc}"]
+        return [], [f"读取 {settings.mcp_config_file} 失败：{exc}"]
 
     servers = raw.get("mcpServers") if isinstance(raw, dict) else None
     if not isinstance(servers, dict):
-        return [], [f"{MCP_CONFIG_FILE} 缺少 mcpServers 配置"]
+        return [], [f"{settings.mcp_config_file} 缺少 mcpServers 配置"]
 
     configs: List[MCPServerConfig] = []
     for name, conf in servers.items():
@@ -122,7 +122,7 @@ class _AsyncRunner:
         self._started.set()
         self._loop.run_forever()
 
-    def submit(self, coro, timeout: float = CONNECT_TIMEOUT) -> Any:
+    def submit(self, coro, timeout: float = 15.0) -> Any:
         if not self._started.wait(3):
             raise RuntimeError("MCP 事件循环线程启动失败")
         done: concurrent.futures.Future = concurrent.futures.Future()
@@ -169,6 +169,34 @@ def _reason(exc: BaseException) -> str:
     if isinstance(exc, MCPClientError):
         return str(exc)
     return _format_error(exc)
+
+
+# 连接类错误特征：命中后触发后台自动重连，而不是当作普通工具错误返回
+_CONNECTION_ERROR_MARKERS = (
+    "连接被中断",
+    "连接失败",
+    "请求超时",
+    "ConnectError",
+    "ConnectionError",
+    "ConnectionReset",
+    "ConnectionRefused",
+    "BrokenResource",
+    "ClosedResource",
+    "EndOfStream",
+    "RemoteProtocol",
+    "disconnected",
+    "Broken pipe",
+    "EOF",
+)
+
+
+def is_connection_error(text: BaseException | str) -> bool:
+    """判断异常/错误文本是否属于连接类问题。"""
+    message = _reason(text) if isinstance(text, BaseException) else str(text)
+    lowered = message.lower()
+    return any(
+        marker.lower() in lowered for marker in _CONNECTION_ERROR_MARKERS
+    )
 
 
 def _as_caller_error(exc: BaseException) -> BaseException:
@@ -286,24 +314,54 @@ class _ServerState:
     tools: List[Any] = field(default_factory=list)
 
 
+@dataclass
+class _ServerStatus:
+    """一个 Server 的连接状态（供后台重连与 TUI 展示）。"""
+
+    config: MCPServerConfig
+    state: str = "connecting"      # connecting / connected / reconnecting
+    attempt: int = 0               # 已失败的重连次数
+    last_error: str = ""
+    retry_in: float = 0.0          # 距离下次重试的秒数（0 表示正在尝试）
+    next_retry_at: float = 0.0     # time.monotonic() 时间点
+
+
 class MCPClientManager:
     """管理多个 MCP Server 会话，并对工具名做 Server 内映射。"""
 
     def __init__(self, project_root: str | Path | None = None) -> None:
         self.project_root = Path(project_root or os.getcwd())
+        settings = load_settings(str(self.project_root))
+        self.connect_timeout = settings.mcp_connect_timeout
+        self.call_timeout = settings.mcp_call_timeout
+        self.reconnect_delays = tuple(settings.mcp_reconnect_delays) or (1.0, 2.0, 5.0, 10.0, 30.0)
         self.configs: List[MCPServerConfig] = []
         self.warnings: List[str] = []
         self._runner: Optional[_AsyncRunner] = None
         self._servers: Dict[str, _ServerState] = {}
+        self._statuses: Dict[str, _ServerStatus] = {}
         self._bindings: Dict[str, Tuple[str, str]] = {}
+        self._reconnect_timers: Dict[str, threading.Timer] = {}
+        self._on_event: Optional[Callable[[str, str, str], None]] = None
+        self._lock = threading.RLock()
         self._initialized = False
         self._init_lock = threading.Lock()
         self._closed = False
 
     # ---------- 初始化 ----------
 
+    def set_event_callback(
+        self, callback: Optional[Callable[[str, str, str], None]]
+    ) -> None:
+        """
+        注册状态回调 callback(event, server, detail)。
+
+        event: connected / lost / reconnecting / reconnect_failed
+        """
+        self._on_event = callback
+
     def initialize(self) -> None:
-        """读取配置并连接所有 Server；幂等，可重复调用。"""
+        """读取配置并连接所有 Server；失败的 Server 转入后台自动重连。"""
         with self._init_lock:
             if self._initialized:
                 return
@@ -322,14 +380,164 @@ class MCPClientManager:
             return
 
         for cfg in configs:
+            status = _ServerStatus(config=cfg)
+            with self._lock:
+                self._statuses[cfg.name] = status
             try:
-                state = self._runner.submit(self._open_server(cfg), CONNECT_TIMEOUT)
-            except Exception as exc:
-                self.warnings.append(
-                    f"MCP Server '{cfg.name}'（{cfg.url}）连接失败：{_reason(exc)}"
+                state = self._runner.submit(
+                    self._open_server(cfg), self.connect_timeout
                 )
+            except Exception as exc:
+                reason = _reason(exc)
+                self._mark_failed(cfg.name, reason, notify="reconnect_failed")
+                self.add_warning(
+                    f"MCP Server '{cfg.name}'（{cfg.url}）连接失败：{reason}，"
+                    "已转入后台自动重连"
+                )
+                self._schedule_reconnect(cfg.name)
                 continue
-            self._servers[cfg.name] = state
+            with self._lock:
+                self._servers[cfg.name] = state
+                status.state = "connected"
+                status.attempt = 0
+                status.last_error = ""
+                status.retry_in = 0.0
+
+    # ---------- 断线重连 ----------
+
+    def _notify(self, event: str, server: str, detail: str = "") -> None:
+        callback = self._on_event
+        if callback is None:
+            return
+        try:
+            callback(event, server, detail)
+        except Exception:
+            pass
+
+    def _mark_failed(
+        self, server: str, reason: str, notify: Optional[str] = None
+    ) -> None:
+        with self._lock:
+            status = self._statuses.get(server)
+            if status is None:
+                return
+            status.state = "reconnecting"
+            status.last_error = reason
+            status.retry_in = 0.0
+        if notify:
+            self._notify(notify, server, reason)
+        self._notify("lost", server, reason)
+
+    def _schedule_reconnect(self, server: str) -> None:
+        """按退避序列为单个 Server 安排一次后台重连。"""
+        with self._lock:
+            if self._closed:
+                return
+            status = self._statuses.get(server)
+            if status is None or status.state == "connected":
+                return
+            if server in self._reconnect_timers:
+                return
+            index = min(status.attempt, len(self.reconnect_delays) - 1)
+            delay = max(0.1, self.reconnect_delays[index])
+            status.state = "reconnecting"
+            status.retry_in = delay
+            status.next_retry_at = time.monotonic() + delay
+            timer = threading.Timer(delay, self._reconnect_attempt, args=(server,))
+            timer.daemon = True
+            self._reconnect_timers[server] = timer
+            timer.start()
+
+    def _reconnect_attempt(self, server: str) -> None:
+        """后台线程：尝试重新连接一个 Server。"""
+        with self._lock:
+            self._reconnect_timers.pop(server, None)
+            if self._closed:
+                return
+            status = self._statuses.get(server)
+            if status is None or status.state == "connected":
+                return
+            if self._servers.get(server) is not None:
+                return
+            status.attempt += 1
+            status.state = "reconnecting"
+            status.retry_in = 0.0
+            attempt = status.attempt
+            last_error = status.last_error
+            config = status.config
+        self._notify("reconnecting", server, last_error)
+
+        runner = self._runner
+        if runner is None:
+            self._mark_failed(server, "MCP 事件循环不可用", "reconnect_failed")
+            self._schedule_reconnect(server)
+            return
+
+        try:
+            state = runner.submit(
+                self._open_server(config), self.connect_timeout
+            )
+        except Exception as exc:
+            reason = _reason(exc)
+            self._mark_failed(server, reason, "reconnect_failed")
+            self.add_warning(
+                f"MCP Server '{server}' 第 {attempt} 次重连失败：{reason}"
+            )
+            self._schedule_reconnect(server)
+            return
+
+        old: Optional[_ServerState] = None
+        with self._lock:
+            old = self._servers.get(server)
+            self._servers[server] = state
+            status.state = "connected"
+            status.attempt = 0
+            status.last_error = ""
+            status.retry_in = 0.0
+        if old is not None:
+            self._close_state(old, blocking=True)
+        self._notify("connected", server, "")
+
+    def _handle_connection_lost(self, server: str, reason: str) -> None:
+        """调用阶段发现连接断开：移除失效会话并转入后台重连。"""
+        old: Optional[_ServerState] = None
+        with self._lock:
+            old = self._servers.pop(server, None)
+        if old is not None:
+            # 调用线程不能等待关闭，交给后台线程处理，避免阻塞对话
+            self._close_state(old, blocking=False)
+        self._mark_failed(server, reason)
+        self._schedule_reconnect(server)
+        self.add_warning(
+            f"MCP Server '{server}' 连接中断：{reason}，已转入后台自动重连"
+        )
+
+    def add_warning(self, message: str) -> None:
+        """追加一条警告，并限制总量，避免持续重连失败时无限增长。"""
+        with self._lock:
+            self.warnings.append(message)
+            if len(self.warnings) > 30:
+                del self.warnings[:-30]
+
+    def _close_state(self, state: _ServerState, blocking: bool = False) -> None:
+        """关闭一个失效会话；blocking=False 时放到后台线程执行。"""
+        runner = self._runner
+        if runner is None or self._closed:
+            return
+        stack = state.stack
+
+        def _close() -> None:
+            try:
+                runner.submit(self._close_stack(stack), 3.0)
+            except Exception:
+                pass
+
+        if blocking:
+            _close()
+            return
+        threading.Thread(
+            target=_close, name=f"xagent-mcp-close-{id(state)}", daemon=True
+        ).start()
 
     async def _open_server(self, cfg: MCPServerConfig) -> _ServerState:
         from mcp import ClientSession
@@ -350,7 +558,7 @@ class MCPClientManager:
                 ClientSession(read_stream, write_stream)
             )
             # SDK 内部基于 anyio cancel scope，用 asyncio.wait_for 会吞掉真实错误
-            with anyio.fail_after(CONNECT_TIMEOUT):
+            with anyio.fail_after(self.connect_timeout):
                 await session.initialize()
                 result = await session.list_tools()
             return _ServerState(
@@ -374,64 +582,140 @@ class MCPClientManager:
     # ---------- 查询 ----------
 
     def connected_servers(self) -> List[str]:
-        return list(self._servers.keys())
+        with self._lock:
+            return list(self._servers.keys())
 
     def server_config(self, server: str) -> Optional[MCPServerConfig]:
-        state = self._servers.get(server)
-        return state.config if state else None
+        with self._lock:
+            state = self._servers.get(server)
+            return state.config if state else None
 
     def server_tools(self, server: str) -> List[Any]:
-        state = self._servers.get(server)
-        return list(state.tools) if state else []
+        with self._lock:
+            state = self._servers.get(server)
+            return list(state.tools) if state else []
+
+    def server_states(self) -> List[Dict[str, Any]]:
+        """
+        返回所有 Server 的状态快照，供 TUI 轮询展示。
+
+        字段：name / url / state / attempt / last_error / retry_in / tools。
+        """
+        now = time.monotonic()
+        snapshots: List[Dict[str, Any]] = []
+        with self._lock:
+            for name, status in self._statuses.items():
+                if status.state == "connected":
+                    state = self._servers.get(name)
+                    tools = [
+                        str(getattr(tool, "name", "")) for tool in state.tools
+                    ] if state else []
+                    retry_in = 0.0
+                else:
+                    tools = []
+                    retry_in = max(0.0, status.next_retry_at - now) \
+                        if status.next_retry_at else 0.0
+                snapshots.append({
+                    "name": name,
+                    "url": status.config.url,
+                    "state": status.state,
+                    "attempt": status.attempt,
+                    "last_error": status.last_error,
+                    "retry_in": retry_in,
+                    "tools": tools,
+                })
+        return snapshots
 
     def bind(self, exposed_name: str, server: str, tool_name: str) -> None:
         """记录 LLM 看到的工具名与 (Server, 原始工具名) 的映射。"""
-        self._bindings[exposed_name] = (server, tool_name)
+        with self._lock:
+            self._bindings[exposed_name] = (server, tool_name)
+
+    def unbind(self, exposed_name: str) -> None:
+        """移除工具名映射（Server 断开或工具重新注册前清理）。"""
+        with self._lock:
+            self._bindings.pop(exposed_name, None)
 
     def bindings(self) -> Dict[str, Tuple[str, str]]:
-        return dict(self._bindings)
+        with self._lock:
+            return dict(self._bindings)
 
     # ---------- 调用 ----------
 
     def call_tool(self, exposed_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        binding = self._bindings.get(exposed_name)
+        with self._lock:
+            binding = self._bindings.get(exposed_name)
         if binding is None:
             return {
                 "success": False,
                 "error": f"未知的 MCP 工具: {exposed_name}",
             }
         server, tool_name = binding
-        state = self._servers.get(server)
+
+        with self._lock:
+            state = self._servers.get(server)
         if state is None or self._runner is None:
-            return {
-                "success": False,
-                "error": f"MCP Server '{server}' 当前不可用",
-            }
-        try:
-            result = self._runner.submit(
-                self._call_with_timeout(state.session, tool_name, arguments or {}),
-                CALL_TIMEOUT + 2,
-            )
-        except Exception as exc:
+            # 会话已失效（可能正在后台重连）：确保重连被安排并提示不可用
+            if not self._closed:
+                self._mark_failed(
+                    server, f"MCP Server '{server}' 已断开，正在后台重连"
+                )
+                self._schedule_reconnect(server)
             return {
                 "success": False,
                 "error": (
-                    f"MCP 工具调用失败（{server}/{tool_name}）：{_reason(exc)}"
+                    f"MCP Server '{server}' 当前不可用（正在后台重连），"
+                    "请稍后重试"
+                ),
+            }
+        try:
+            result = self._runner.submit(
+                self._call_with_timeout(
+                    state.session, tool_name, arguments or {}
+                ),
+                self.call_timeout + 2,
+            )
+        except Exception as exc:
+            reason = _reason(exc)
+            if is_connection_error(exc):
+                # 连接类错误：判定会话失效，转入后台自动重连
+                self._handle_connection_lost(server, reason)
+                return {
+                    "success": False,
+                    "error": (
+                        f"MCP Server '{server}' 连接中断，已转入后台自动重连："
+                        f"{reason}"
+                    ),
+                }
+            return {
+                "success": False,
+                "error": (
+                    f"MCP 工具调用失败（{server}/{tool_name}）：{reason}"
                 ),
             }
         return convert_call_result(server, tool_name, result)
 
-    @staticmethod
-    async def _call_with_timeout(session: Any, tool_name: str, arguments: Dict[str, Any]) -> Any:
-        with anyio.fail_after(CALL_TIMEOUT):
+    async def _call_with_timeout(
+        self, session: Any, tool_name: str, arguments: Dict[str, Any]
+    ) -> Any:
+        with anyio.fail_after(self.call_timeout):
             return await session.call_tool(tool_name, arguments=arguments)
 
     # ---------- 关闭 ----------
 
     def shutdown(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            timers = list(self._reconnect_timers.values())
+            self._reconnect_timers.clear()
+        for timer in timers:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+
         runner = self._runner
         if runner is None:
             return
@@ -440,7 +724,8 @@ class MCPClientManager:
                 runner.submit(self._close_stack(state.stack), 5.0)
             except Exception:
                 pass
-        self._servers.clear()
+        with self._lock:
+            self._servers.clear()
         try:
             runner.stop()
         except Exception:

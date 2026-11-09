@@ -33,27 +33,55 @@ import json
 import os
 import time
 import unicodedata
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Vertical, Horizontal, VerticalScroll
 from textual.reactive import reactive
+from textual.screen import ModalScreen
 from textual.widgets import (
-    Static, Input, Button, Label,
+    Static, Input, Button, Label, ListView, ListItem,
 )
 
 from xAgent.core import ToolService, ToolResult
-from xAgent.core.registry import get_mcp_warnings
+from xAgent.core.registry import (
+    ensure_mcp_tools, get_mcp_warnings, mcp_status, mcp_server_states,
+)
+from xAgent.core.context import (
+    ContextManager, CompactionError, compact_messages, estimate_tokens,
+)
 from xAgent.core.skills import (
     build_skill_prompt, discover_skills, get_skill_registry,
 )
-from xAgent.core.config import (
-    QIANFAN_API_KEY, QIANFAN_BASE_URL, QIANFAN_MODEL,
-)
+from xAgent.core.config import ensure_config_file, load_settings
 from xAgent.core.llm import (
     LLMMessage, ToolCall, MockProvider, OpenAICompatibleProvider,
 )
+from xAgent.core.sessions import SessionMeta, SessionStore
+
+
+# ============================================================
+# 斜杠命令 / AGENTS.md 标记
+# ============================================================
+
+# (命令, 说明) —— 同时用于 / 补全面板与 /help
+SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("/help", "显示帮助"),
+    ("/new", "新建会话（自动保存当前会话）"),
+    ("/resume", "恢复历史会话（↑/↓ + Enter）"),
+    ("/save", "保存当前会话"),
+    ("/compact", "压缩当前上下文"),
+    ("/clear", "清空对话显示"),
+    ("/tools", "列出可用工具"),
+    ("/cwd", "显示当前目录"),
+    ("/model", "显示当前模型与接口"),
+    ("/mcp", "显示 MCP 服务器状态"),
+    ("/quit", "退出程序"),
+)
+
+AGENTS_MARKER = "[项目规范] AGENTS.md"
 
 
 # ============================================================
@@ -90,12 +118,13 @@ class CustomHeader(Vertical):
         # 老师显示完整路径，太长就截断末尾
         if len(cwd) > 45:
             cwd = "..." + cwd[-42:]
+        self._model_label = "mock"
         self._line1 = Static(
             f"xAgent · {tool_count} 个工具 · mock · {cwd}",
             classes="line1",
         )
         self._line2 = Static(
-            "  Enter 发送  /help 命令  Esc 中断  Ctrl+B 侧栏  Ctrl+N 新会话",
+            "  Enter 发送  输入 / 查看命令  Esc 中断  Ctrl+B 侧栏  Ctrl+N 新会话",
             classes="line2",
         )
 
@@ -104,10 +133,18 @@ class CustomHeader(Vertical):
         yield self._line2
 
     def set_model(self, model: str) -> None:
+        self._model_label = model
+        self._refresh_line1()
+
+    def set_tool_count(self) -> None:
+        self._refresh_line1()
+
+    def _refresh_line1(self) -> None:
         tool_count = len(ToolService.list_tools())
         cwd = os.getcwd()
         if len(cwd) > 45:
             cwd = "..." + cwd[-42:]
+        model = getattr(self, "_model_label", "mock")
         self._line1.update(f"xAgent · {tool_count} 个工具 · {model} · {cwd}")
 
 
@@ -316,6 +353,16 @@ class Sidebar(VerticalScroll):
         height: auto;
         text-wrap: wrap;
     }
+    Sidebar #tool-list {
+        height: auto;
+        width: 1fr;
+    }
+    Sidebar #side-mcp {
+        color: $text-muted;
+        width: 1fr;
+        height: auto;
+        text-wrap: wrap;
+    }
     Sidebar.-collapsed {
         width: 5;
     }
@@ -327,6 +374,7 @@ class Sidebar(VerticalScroll):
     _INFO_ROWS = (
         ("side-session", "会话  ", "mock"),
         ("side-model", "模型  ", "mock"),
+        ("side-context", "上下文  ", "-"),
         ("side-api", "接口  ", "-"),
         ("side-cwd", "目录  ", ""),
         ("side-skills", "技能  ", "-"),
@@ -354,15 +402,21 @@ class Sidebar(VerticalScroll):
         yield Label("工具", classes="section-label")
 
         self._tool_rows: List[tuple] = []
-        for index, t in enumerate(ToolService.list_tools(), start=1):
-            name_label = Label("", classes="kv")
-            desc_label = Label("", classes="kv tdesc-line") if t.description else None
-            self._tool_rows.append(
-                (name_label, desc_label, index, t.name, t.description or "")
-            )
-            yield name_label
-            if desc_label is not None:
-                yield desc_label
+        with Vertical(id="tool-list"):
+            for index, t in enumerate(ToolService.list_tools(), start=1):
+                name_label = Label("", classes="kv")
+                desc_label = (
+                    Label("", classes="kv tdesc-line") if t.description else None
+                )
+                self._tool_rows.append(
+                    (name_label, desc_label, index, t.name, t.description or "")
+                )
+                yield name_label
+                if desc_label is not None:
+                    yield desc_label
+
+        yield Label("MCP", classes="section-label")
+        yield Static("加载中…", id="side-mcp")
 
     def on_mount(self) -> None:
         self.call_after_refresh(self._refresh_width)
@@ -413,6 +467,73 @@ class Sidebar(VerticalScroll):
     def set_api(self, text: str) -> None:
         self._set_value("side-api", text)
 
+    def set_context(self, text: str) -> None:
+        self._set_value("side-context", text)
+
+    def set_model_limit(self, count: int) -> None:
+        self._set_value("side-limit", f"{count} 次模型调用/轮")
+
+    # ---------- 工具 / MCP 区域 ----------
+
+    def refresh_tools(self) -> None:
+        """重新渲染工具列表（MCP 工具异步注册后调用）。"""
+        if not self.is_mounted:
+            return
+        container = self.query_one("#tool-list", Vertical)
+        container.remove_children()
+        self._tool_rows = []
+        for index, t in enumerate(ToolService.list_tools(), start=1):
+            name_label = Label("", classes="kv")
+            desc_label = (
+                Label("", classes="kv tdesc-line") if t.description else None
+            )
+            self._tool_rows.append(
+                (name_label, desc_label, index, t.name, t.description or "")
+            )
+            container.mount(name_label)
+            if desc_label is not None:
+                container.mount(desc_label)
+        self.call_after_refresh(self._refresh_width)
+
+    def set_mcp_status(
+        self,
+        states: List[Dict[str, Any]],
+        warnings: Optional[List[str]] = None,
+        loading: bool = False,
+    ) -> None:
+        """更新 MCP 区域：已连接服务器 + 可用工具 + 重连进度。"""
+        if not self.is_mounted:
+            return
+        if loading:
+            text = "加载中…"
+        elif not states:
+            text = "未连接"
+            if warnings:
+                text += f"（{warnings[0]}）"
+        else:
+            lines: List[str] = []
+            for st in states:
+                name = str(st.get("name", ""))
+                state = str(st.get("state", ""))
+                if state == "connected":
+                    tools = st.get("tools") or []
+                    lines.append(f"▸ {name}（{len(tools)}）")
+                    for tool in tools:
+                        lines.append(f"    · {tool}")
+                    continue
+                if state == "connecting":
+                    lines.append(f"… {name} 连接中")
+                else:
+                    attempt = int(st.get("attempt") or 0)
+                    retry_in = float(st.get("retry_in") or 0.0)
+                    wait = f"{retry_in:.0f}s 后重试" if retry_in > 0 else "正在重试"
+                    lines.append(f"⟳ {name} 重连中（第 {attempt} 次，{wait}）")
+                error = str(st.get("last_error") or "").strip()
+                if error:
+                    lines.append(f"    ! {error[:80]}")
+            text = "\n".join(lines)
+        self.query_one("#side-mcp", Static).update(text)
+
     # ---------- Skill 加载角标 ----------
 
     def _skill_display(self) -> str:
@@ -457,6 +578,168 @@ class Sidebar(VerticalScroll):
         """最小化状态下点击竖条任意位置恢复侧栏。"""
         if self._collapsed:
             self.toggle_collapsed()
+
+
+# ============================================================
+# 输入框：斜杠补全面板可见时接管方向键 / Enter / Esc / Tab
+# ============================================================
+
+class PromptInput(Input):
+    """命令补全激活时，↑/↓/Tab/Enter/Esc 交给 App 处理。"""
+
+    async def _on_key(self, event) -> None:
+        app = self.app
+        if getattr(app, "completion_visible", False) and event.key in (
+            "up", "down", "tab", "enter", "escape",
+        ):
+            event.stop()
+            event.prevent_default()
+            if event.key == "up":
+                app.completion_move(-1)
+            elif event.key == "down":
+                app.completion_move(1)
+            elif event.key == "tab":
+                app.completion_accept(execute=False)
+            elif event.key == "enter":
+                app.completion_accept(execute=True)
+            else:
+                app.hide_completion()
+            return
+        await super()._on_key(event)
+
+
+# ============================================================
+# 启动提示对话框（首次生成 config.ini 时弹出）
+# ============================================================
+
+class NotifyDialog(ModalScreen[None]):
+    """居中的提示对话框，Esc / Enter / 按钮均可关闭。"""
+
+    BINDINGS = [
+        Binding("escape", "close_dialog", show=False),
+        Binding("enter", "close_dialog", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    NotifyDialog {
+        align: center middle;
+    }
+    NotifyDialog #notify-box {
+        width: 76;
+        height: auto;
+        padding: 1 2;
+        border: thick $warning;
+        background: $surface;
+    }
+    NotifyDialog #notify-title {
+        width: 1fr;
+        height: auto;
+        color: $warning;
+        text-style: bold;
+        padding-bottom: 1;
+    }
+    NotifyDialog #notify-message {
+        width: 1fr;
+        height: auto;
+        color: $text;
+        text-wrap: wrap;
+    }
+    NotifyDialog #notify-ok {
+        margin-top: 1;
+        width: 16;
+    }
+    """
+
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__()
+        self._title = title
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="notify-box"):
+            yield Static(self._title, id="notify-title")
+            yield Static(self._message, id="notify-message")
+            yield Button("知道了", id="notify-ok")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "notify-ok":
+            self.dismiss(None)
+
+    def action_close_dialog(self) -> None:
+        self.dismiss(None)
+
+
+# ============================================================
+# /resume 历史会话列表（↑/↓ 选择，Enter 恢复，Esc 取消）
+# ============================================================
+
+class SessionItem(ListItem):
+    """列表项携带会话编号。"""
+
+    def __init__(self, meta: SessionMeta) -> None:
+        stamp = meta.updated_at or meta.created_at or "-"
+        preview = meta.title or "未命名会话"
+        super().__init__(Label(f"{stamp}  {preview}  ({meta.message_count} 条)"))
+        self.session_id = meta.session_id
+
+
+class SessionListScreen(ModalScreen[Optional[str]]):
+    """历史会话列表面板。"""
+
+    BINDINGS = [Binding("escape", "cancel_dialog", show=False)]
+
+    DEFAULT_CSS = """
+    SessionListScreen {
+        align: center middle;
+    }
+    SessionListScreen #session-box {
+        width: 76;
+        height: 22;
+        padding: 1 1;
+        border: thick $primary;
+        background: $surface;
+    }
+    SessionListScreen #session-title {
+        width: 1fr;
+        height: 1;
+        color: $accent;
+        text-style: bold;
+        padding: 0 1;
+    }
+    SessionListScreen #session-list {
+        height: 1fr;
+        width: 1fr;
+        margin-top: 1;
+    }
+    """
+
+    def __init__(self, sessions: List[SessionMeta]) -> None:
+        super().__init__()
+        self._sessions = sessions
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="session-box"):
+            yield Static(
+                "历史会话 · ↑/↓ 选择 · Enter 恢复 · Esc 取消",
+                id="session-title",
+            )
+            yield ListView(
+                *[SessionItem(meta) for meta in self._sessions],
+                id="session-list",
+            )
+
+    def on_mount(self) -> None:
+        view = self.query_one("#session-list", ListView)
+        view.focus()
+        if len(view.children):
+            view.index = 0
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        session_id = getattr(event.item, "session_id", None)
+        self.dismiss(session_id)
+
+    def action_cancel_dialog(self) -> None:
+        self.dismiss(None)
 
 
 # ============================================================
@@ -543,14 +826,28 @@ class XAgentApp(App):
     # Textual App 元信息（不用默认 Header/Footer）
     TITLE = "xAgent"
 
-    # Ctrl+B：输入框有焦点时也能触发（单个 b 会被输入框吃掉）
+    # Ctrl+B / Ctrl+N：输入框有焦点时也能触发
     BINDINGS = [
         Binding("ctrl+b", "toggle_sidebar", "侧栏"),
+        Binding("ctrl+n", "new_session", "新会话"),
     ]
 
     CSS = """
     Screen { layout: vertical; }
     #main-row { layout: horizontal; height: 1fr; }
+    #completion-panel {
+        height: auto;
+        padding: 0 1;
+        display: none;
+    }
+    #completion-panel.visible { display: block; }
+    #completion-list {
+        width: 100%;
+        height: auto;
+        padding: 0 1;
+        color: $text-muted;
+        background: $surface-darken-1;
+    }
     #prompt-row { layout: horizontal; height: auto; padding: 0 1; }
     #prompt Input { width: 100%; }
     """
@@ -562,6 +859,41 @@ class XAgentApp(App):
     _provider: Any
     _model_label: str = "mock"
     _skill_prompt: str = ""
+    _context_mgr: Optional[ContextManager] = None
+    _compacting: bool = False
+    _context_blocked: bool = False
+    _context_warned: bool = False
+
+    # 斜杠补全
+    _completion_matches: List[tuple[str, str]] = []
+    _completion_index: int = 0
+    _completion_visible: bool = False
+
+    # 会话
+    _session_id: Optional[str] = None
+    _session_created_at: str = ""
+    _agents_injected: bool = False
+    _mcp_warnings_shown: set[str] = set()
+    _mcp_loaded: bool = False
+    _mcp_states_seen: Dict[str, str] = {}
+    _mcp_tool_signature: tuple = ()
+
+    def __init__(
+        self,
+        config_created: Optional[bool] = None,
+        config_path: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        if config_created is None:
+            path, created = ensure_config_file()
+            config_created, config_path = created, str(path)
+        self._config_created = bool(config_created)
+        self._config_path = config_path or "config.ini"
+        self._mcp_warnings_shown = set()
+        self._mcp_loaded = False
+        self._mcp_states_seen = {}
+        self._mcp_tool_signature = ()
 
     def compose(self) -> ComposeResult:
         # 自定义 Header（老师样式）
@@ -572,10 +904,14 @@ class XAgentApp(App):
             yield ConversationFlow(id="conversation")
             yield Sidebar(id="sidebar")
 
+        # 斜杠命令补全面板（默认隐藏）
+        with Container(id="completion-panel"):
+            yield Static("", id="completion-list", markup=False)
+
         # 底部输入框
         with Container(id="prompt-row"):
-            yield Input(
-                placeholder="输入问题后 Enter 发送 · /help Esc 中断生成",
+            yield PromptInput(
+                placeholder="输入问题后 Enter 发送 · 输入 / 查看命令",
                 id="prompt",
                 restrict=None,
             )
@@ -589,41 +925,170 @@ class XAgentApp(App):
     def on_mount(self) -> None:
         self._conversation = self.query_one("#conversation", ConversationFlow)
         self._sidebar = self.query_one("#sidebar", Sidebar)
-        self._prompt = self.query_one("#prompt", Input)
+        self._prompt = self.query_one("#prompt", PromptInput)
         self._status = self.query_one(StatusBar)
         self._header = self.query_one(CustomHeader)
+        self._completion_panel = self.query_one("#completion-panel", Container)
+        self._completion_list = self.query_one("#completion-list", Static)
+
+        # 配置 / 会话存储
+        self._settings = load_settings()
+        self._store = SessionStore()
+        self._session_id = self._store.new_id()
+        self._session_created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._sidebar.styles.width = self._settings.sidebar_width
+        self._sidebar.set_model_limit(self._settings.max_model_calls)
 
         # 按 config 初始化 LLM
         self._init_provider()
+
+        # 上下文管理：跟踪 Token 用量、归档与压缩
+        self._messages = []
+        self._context_mgr = ContextManager(
+            project_root=os.getcwd(), model=self._model_label
+        )
+        self._update_context_display()
 
         # Skill 发现：以启动时的工作目录为项目根目录，只加载 name / description
         registry = discover_skills()
         self._skill_prompt = build_skill_prompt(registry)
         self._sidebar.set_skill_total(len(registry.skills))
 
+        # 会话首次加载：注入 Skill 清单 + AGENTS.md（一次注入，后续复用）
+        self._ensure_skill_prompt()
+        self._inject_agents_md()
+
         # 欢迎消息
         self._conversation.add_assistant_message(
             "你好，我是 xAgent。我可以帮你操作文件系统。\n\n"
             "试试：'列出当前目录'、'读取 README.md 的内容'、"
-            "'创建文件 demo.txt' 或者输入 /help。"
+            "'创建文件 demo.txt'，或输入 /help 查看命令。"
         )
-        # MCP Server 连接失败时给出明确提示，但不影响本地工具
-        for warning in get_mcp_warnings():
-            self._conversation.add_assistant_message(f"MCP 连接异常：{warning}")
+        if self._config_created:
+            self._conversation.add_assistant_message(
+                f"已生成新的配置文件：{self._config_path}\n"
+                "当前使用 Mock 模型，请修改配置后重新启动 xAgent。"
+            )
+            self.call_after_refresh(self._show_config_notice)
+
+        # MCP 异步加载：先进入界面，加载完成后刷新边栏
+        self._sidebar.set_mcp_status([], [], loading=True)
+        self.run_worker(
+            self._load_mcp_worker, thread=True, name="mcp-loader"
+        )
+        # 周期轮询 MCP 状态：后台重连进度与恢复情况实时反映到界面
+        self.set_interval(1.0, self._poll_mcp_status)
+
         self._prompt.focus()
+
+    # ---------- 启动提示 ----------
+
+    def _show_config_notice(self) -> None:
+        self.push_screen(
+            NotifyDialog(
+                "已生成 config.ini",
+                f"首次运行已在当前目录创建配置文件：\n{self._config_path}\n\n"
+                "当前使用 Mock 信息，修改文件（provider / api_key / model）"
+                "后重新启动 xAgent 才能正常工作。",
+            )
+        )
+
+    # ---------- MCP 异步加载 ----------
+
+    def _load_mcp_worker(self) -> None:
+        try:
+            ensure_mcp_tools()
+        except Exception:
+            pass
+        try:
+            self.call_from_thread(self._refresh_mcp_ui)
+        except Exception:
+            pass
+
+    def _refresh_mcp_ui(self) -> None:
+        states = mcp_server_states()
+        warnings = get_mcp_warnings()
+        self._sidebar.set_mcp_status(states, warnings)
+        self._sidebar.refresh_tools()
+        self._header.set_tool_count()
+        self._mcp_loaded = True
+        self._mcp_states_seen = {
+            str(st.get("name", "")): str(st.get("state", "")) for st in states
+        }
+        self._mcp_tool_signature = self._tool_signature(states)
+        for warning in warnings:
+            if warning not in self._mcp_warnings_shown:
+                self._mcp_warnings_shown.add(warning)
+                self._conversation.add_assistant_message(
+                    f"MCP 连接异常：{warning}"
+                )
+
+    @staticmethod
+    def _tool_signature(states: List[Dict[str, Any]]) -> tuple:
+        """已连接 Server 与工具数量的签名，用于判断是否需要重绘工具列表。"""
+        return tuple(sorted(
+            (str(st.get("name", "")), len(st.get("tools") or []))
+            for st in states
+            if str(st.get("state")) == "connected"
+        ))
+
+    def _poll_mcp_status(self) -> None:
+        """主线程周期轮询：展示重连进度，并在状态变化时提示用户。"""
+        if not self._mcp_loaded:
+            return
+        states = mcp_server_states()
+        prev = self._mcp_states_seen
+        current = {
+            str(st.get("name", "")): str(st.get("state", "")) for st in states
+        }
+
+        for st in states:
+            name = str(st.get("name", ""))
+            state = str(st.get("state", ""))
+            old = prev.get(name)
+            if old == state:
+                continue
+            if state == "reconnecting" and old in (None, "connected"):
+                attempt = int(st.get("attempt") or 0)
+                detail = str(st.get("last_error") or "").strip()
+                suffix = f"（{detail}）" if detail else ""
+                self._conversation.add_assistant_message(
+                    f"MCP Server '{name}' 连接中断{suffix}，"
+                    f"正在后台自动重连（第 {max(attempt, 1)} 次）"
+                )
+            elif state == "connected" and old == "reconnecting":
+                count = len(st.get("tools") or [])
+                self._conversation.add_assistant_message(
+                    f"MCP Server '{name}' 已恢复连接，"
+                    f"已重新注册 {count} 个工具"
+                )
+
+        self._mcp_states_seen = current
+
+        signature = self._tool_signature(states)
+        tools_changed = signature != self._mcp_tool_signature
+        if tools_changed:
+            self._mcp_tool_signature = signature
+            self._sidebar.refresh_tools()
+            self._header.set_tool_count()
+
+        # 有 Server 处于重连中时每秒重绘边栏，让「剩余秒数」实时更新
+        if tools_changed or any(v != "connected" for v in current.values()):
+            self._sidebar.set_mcp_status(states, get_mcp_warnings())
 
     # ---------- LLM 初始化 ----------
 
     def _init_provider(self) -> None:
-        """有 Key 用千帆，无 Key 回落本地 Mock。"""
-        if QIANFAN_API_KEY:
+        """provider=qianfan 且有 Key 时使用真实接口，否则回落本地 Mock。"""
+        settings = load_settings()
+        if not settings.use_mock:
             self._provider = OpenAICompatibleProvider(
-                api_key=QIANFAN_API_KEY,
-                base_url=QIANFAN_BASE_URL,
-                model=QIANFAN_MODEL,
+                api_key=settings.api_key,
+                base_url=settings.base_url,
+                model=settings.model,
             )
-            self._model_label = QIANFAN_MODEL
-            api_label = QIANFAN_BASE_URL
+            self._model_label = settings.model
+            api_label = settings.base_url
         else:
             self._provider = MockProvider()
             self._model_label = "mock"
@@ -638,42 +1103,57 @@ class XAgentApp(App):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
         event.input.value = ""
+        self.hide_completion()
         if not text:
             return
         if text.startswith("/"):
             self._handle_command(text)
-        else:
-            self._run_user_turn(text)
+            return
+        if self._compacting:
+            self._conversation.add_assistant_message(
+                "正在压缩上下文，请等待压缩完成后再输入。"
+            )
+            return
+        if self._context_blocked:
+            usage = self._context_mgr.usage(self._messages) if self._context_mgr else None
+            detail = f"（当前 {usage.display()}）" if usage else ""
+            ratio = int(load_settings().context_warn_ratio * 100)
+            self._conversation.add_assistant_message(
+                f"上下文已达到 {ratio}% 警告阈值{detail}，"
+                "请先执行 /compact 压缩上下文后再继续。"
+            )
+            return
+        self._run_user_turn(text)
 
     def _handle_command(self, cmd: str) -> None:
         parts = cmd.split(maxsplit=1)
         head = parts[0].lower()
 
         if head in ("/help", "/?"):
-            self._conversation.add_assistant_message(
-                """xAgent 帮助
-
-使用方式：直接输入自然语言，我会自动选择工具。
-
-命令：
-  /help              显示此帮助
-  /clear             清空对话
-  /new               新建会话
-  /tools             列出所有工具
-  /cwd               显示当前目录
-  /model             查看当前模型与接口
-  /quit              退出程序"""
-            )
+            lines = [
+                "xAgent 帮助",
+                "",
+                "使用方式：直接输入自然语言，我会自动选择工具。",
+                "",
+                "命令：",
+            ]
+            for name, desc in SLASH_COMMANDS:
+                lines.append(f"  {name:<10} {desc}")
+            lines += ["", "提示：输入 / 会弹出补全面板，↑/↓ 选择，Enter 执行，Esc 关闭。"]
+            self._conversation.add_assistant_message("\n".join(lines))
+        elif head == "/compact":
+            self._compact_context()
         elif head == "/clear":
             self._conversation.clear_all()
+            self._conversation.add_assistant_message(
+                "对话显示已清空（历史仍保留在上下文中）。"
+            )
         elif head == "/new":
-            self._conversation.clear_all()
-            self._messages = []
-            self.round_no = 1
-            self.tool_calls_total = 0
-            self._sidebar.set_round(1)
-            self._sidebar.reset_skill_loaded()
-            self._conversation.add_assistant_message("新会话已创建。")
+            self._new_session()
+        elif head == "/save":
+            self._save_session(verbose=True)
+        elif head == "/resume":
+            self._show_session_list()
         elif head == "/tools":
             lines = []
             for t in ToolService.list_tools():
@@ -682,18 +1162,258 @@ class XAgentApp(App):
         elif head == "/cwd":
             self._conversation.add_assistant_message(f"当前目录：{os.getcwd()}")
         elif head == "/model":
+            settings = load_settings()
+            api = settings.base_url if not settings.use_mock else "-"
             self._conversation.add_assistant_message(
                 f"模型：{self._model_label}\n"
-                f"接口：{QIANFAN_BASE_URL if QIANFAN_API_KEY else '-'}"
+                f"接口：{api}\n"
+                f"配置：{settings.config_path}"
             )
+        elif head == "/mcp":
+            states = mcp_server_states()
+            if states:
+                lines = ["MCP 服务器："]
+                for st in states:
+                    name = str(st.get("name", ""))
+                    if str(st.get("state")) == "connected":
+                        tools = st.get("tools") or []
+                        lines.append(f"  ▸ {name}（{len(tools)} 个工具）")
+                        lines.extend(f"      · {tool}" for tool in tools)
+                    else:
+                        attempt = int(st.get("attempt") or 0)
+                        retry_in = float(st.get("retry_in") or 0.0)
+                        lines.append(
+                            f"  ⟳ {name} 重连中（第 {attempt} 次，"
+                            f"{retry_in:.0f}s 后重试）"
+                        )
+                        error = str(st.get("last_error") or "").strip()
+                        if error:
+                            lines.append(f"      ! {error}")
+                self._conversation.add_assistant_message("\n".join(lines))
+            else:
+                self._conversation.add_assistant_message(
+                    "当前没有配置 MCP 服务器。请检查 .mcp.json。"
+                )
         elif head in ("/quit", "/exit", "/q"):
+            self._save_session(quiet=True)
             self.exit()
         else:
-            self._conversation.add_assistant_message(f"未知命令：{cmd}。输入 /help 查看可用命令。")
+            self._conversation.add_assistant_message(
+                f"未知命令：{cmd}。输入 /help 查看可用命令。"
+            )
+
+    # ---------- 会话管理 ----------
+
+    def _reset_conversation_state(self) -> None:
+        """清空内存中的对话状态（不动会话文件）。"""
+        self._conversation.clear_all()
+        self._messages = []
+        self._agents_injected = False
+        self.round_no = 1
+        self.tool_calls_total = 0
+        self._sidebar.set_round(1)
+        self._sidebar.reset_skill_loaded()
+        if self._context_mgr:
+            self._context_mgr.reset_usage()
+        self._context_blocked = False
+        self._context_warned = False
+
+    def _new_session(self) -> None:
+        """保存当前会话并新建一个空会话。"""
+        saved = self._save_session(quiet=True)
+        self._reset_conversation_state()
+        self._session_id = self._store.new_id()
+        self._session_created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._ensure_skill_prompt()
+        self._inject_agents_md()
+        self._update_context_display()
+        message = "新会话已创建。"
+        if saved is not None:
+            message += f"\n上一个会话已保存：{saved.session_id}"
+        self._conversation.add_assistant_message(message)
+
+    def _save_session(self, quiet: bool = False, verbose: bool = False):
+        """保存当前会话到 .agents/sessions，返回 SessionMeta。"""
+        if not any(m.role != "system" for m in self._messages):
+            if verbose:
+                self._conversation.add_assistant_message("当前没有可保存的对话内容。")
+            return None
+        try:
+            meta = self._store.save(
+                self._messages,
+                session_id=self._session_id,
+                created_at=self._session_created_at,
+            )
+        except Exception as exc:
+            if not quiet:
+                self._conversation.add_assistant_message(f"保存会话失败：{exc}")
+            return None
+
+        self._session_id = meta.session_id
+        if verbose and not quiet:
+            self._conversation.add_assistant_message(
+                f"会话已保存：{meta.session_id}\n"
+                f"位置：{self._store.path_for(meta.session_id)}"
+            )
+        return meta
+
+    def _show_session_list(self) -> None:
+        sessions = self._store.list()
+        if not sessions:
+            self._conversation.add_assistant_message("还没有保存过的会话。")
+            return
+        self.push_screen(
+            SessionListScreen(sessions), callback=self._on_session_picked
+        )
+
+    def _on_session_picked(self, session_id: Optional[str]) -> None:
+        if not session_id:
+            return
+        # 切换前先保存当前会话，避免丢失
+        self._save_session(quiet=True)
+        try:
+            meta, loaded = self._store.load(session_id)
+        except Exception as exc:
+            self._conversation.add_assistant_message(f"恢复会话失败：{exc}")
+            return
+
+        self._reset_conversation_state()
+        self._session_id = session_id
+        self._session_created_at = meta.created_at or datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        # 还原非 System 消息
+        self._messages = [m for m in loaded if m.role != "system"]
+        agents_message = next(
+            (
+                m for m in loaded
+                if m.role == "system" and m.content.startswith(AGENTS_MARKER)
+            ),
+            None,
+        )
+        self._ensure_skill_prompt()
+        if agents_message is not None:
+            self._messages.insert(1, agents_message)
+            self._agents_injected = True
+        else:
+            self._inject_agents_md()
+
+        self._render_history(self._messages)
+        user_rounds = sum(1 for m in self._messages if m.role == "user")
+        self.round_no = max(1, user_rounds)
+        self._sidebar.set_round(self.round_no)
+        self._update_context_display()
+        self._conversation.add_assistant_message(
+            f"已恢复会话：{meta.title}（{meta.session_id}，"
+            f"{meta.message_count} 条消息）"
+        )
+        self._prompt.focus()
+
+    def _render_history(self, messages: List[LLMMessage]) -> None:
+        """把历史消息回显到对话区（工具结果只显示摘要）。"""
+        for message in messages:
+            if message.role == "user":
+                self._conversation.add_user_message(message.content or "")
+            elif message.role == "assistant":
+                if (message.content or "").strip():
+                    self._conversation.add_assistant_message(message.content)
+                if message.tool_calls:
+                    names = "、".join(tc.name for tc in message.tool_calls)
+                    self._conversation.add_assistant_message(f"[调用工具] {names}")
+            elif message.role == "tool":
+                text = (message.content or "").replace("\n", " ")
+                if len(text) > 160:
+                    text = text[:157] + "..."
+                self._conversation.add_assistant_message(f"[工具结果] {text}")
+
+    def _inject_agents_md(self) -> None:
+        """会话首次加载时把 AGENTS.md 作为一条 System 消息注入，后续复用。"""
+        if self._agents_injected:
+            return
+        self._agents_injected = True
+        path = self._store.root / load_settings().agents_md_file
+        if not path.is_file():
+            return
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore").strip()
+        except OSError:
+            return
+        if not content:
+            return
+        message = LLMMessage(
+            role="system",
+            content=f"{AGENTS_MARKER}\n\n{content}",
+        )
+        index = 1 if self._messages and self._messages[0].role == "system" else 0
+        self._messages.insert(index, message)
+        self._update_context_display()
+
+    # ---------- 斜杠命令补全 ----------
+
+    @property
+    def completion_visible(self) -> bool:
+        return self._completion_visible
+
+    def _refresh_completion(self, value: str) -> None:
+        if not value.startswith("/") or " " in value:
+            self.hide_completion()
+            return
+
+        query = value[1:].lower()
+        matches = [
+            (name, desc)
+            for name, desc in SLASH_COMMANDS
+            if name[1:].lower().startswith(query)
+        ]
+        if not matches:
+            self.hide_completion()
+            return
+
+        self._completion_matches = matches
+        self._completion_index = 0
+        self._completion_visible = True
+        self._completion_panel.add_class("visible")
+        self._render_completion()
+
+    def hide_completion(self) -> None:
+        self._completion_visible = False
+        self._completion_matches = []
+        self._completion_index = 0
+        self._completion_panel.remove_class("visible")
+
+    def _render_completion(self) -> None:
+        lines = ["命令补全  ↑/↓ 选择 · Enter 执行 · Esc 关闭", ""]
+        for index, (name, desc) in enumerate(self._completion_matches):
+            marker = "▸" if index == self._completion_index else " "
+            lines.append(f" {marker} {name:<10} {desc}")
+        self._completion_list.update("\n".join(lines))
+
+    def completion_move(self, delta: int) -> None:
+        if not self._completion_visible or not self._completion_matches:
+            return
+        total = len(self._completion_matches)
+        self._completion_index = (self._completion_index + delta) % total
+        self._render_completion()
+
+    def completion_accept(self, execute: bool) -> None:
+        if not self._completion_matches:
+            return
+        command = self._completion_matches[self._completion_index][0]
+        self._prompt.value = command
+        self._prompt.cursor_position = len(command)
+        self.hide_completion()
+        if execute:
+            self._prompt.value = ""
+            self._handle_command(command)
+        self._prompt.focus()
 
     # ---------- 核心：一轮对话 ----------
 
-    _MAX_MODEL_CALLS = 8  # 单轮最多模型调用次数，防止工具死循环
+    @property
+    def _max_model_calls(self) -> int:
+        """单轮最多模型调用次数（来自 config.ini，防止工具死循环）。"""
+        return max(1, load_settings().max_model_calls)
 
     def _ensure_skill_prompt(self) -> None:
         """把 Skill 清单注入 System Prompt；/new 清空历史后重新注入。"""
@@ -704,11 +1424,115 @@ class XAgentApp(App):
         self._messages.insert(
             0, LLMMessage(role="system", content=self._skill_prompt)
         )
+        self._update_context_display()
+
+    # ---------- 上下文用量 / 压缩 ----------
+
+    def _update_context_display(self) -> None:
+        """刷新侧栏上下文用量；达到配置阈值时警告并暂停普通输入。"""
+        if not self._context_mgr:
+            return
+        ratio = int(load_settings().context_warn_ratio * 100)
+        usage = self._context_mgr.usage(self._messages)
+        text = usage.display()
+        if usage.over_threshold:
+            text += f" · 已达 {ratio}%，请 /compact"
+        self._sidebar.set_context(text)
+
+        if usage.over_threshold and not self._context_warned:
+            self._context_warned = True
+            self._context_blocked = True
+            self._sidebar.set_status("需压缩")
+            self._conversation.add_assistant_message(
+                f"上下文已使用 {usage.display()}，达到 {ratio}% 警告阈值。\n"
+                "请执行 /compact 压缩上下文；在压缩成功前将暂停接受新的普通提示词。"
+            )
+
+    def _track_response_usage(self, response: LLMMessage, sent_index: int) -> None:
+        """优先采用模型 API 的 prompt_tokens，随后估算新增消息。"""
+        usage = getattr(response, "usage", None) or {}
+        prompt_tokens = usage.get("prompt_tokens") or usage.get("total_tokens")
+        if self._context_mgr and prompt_tokens:
+            self._context_mgr.record_api_usage(int(prompt_tokens), sent_index)
+        self._update_context_display()
+
+    def _compact_context(self) -> None:
+        """执行 /compact：归档原始上下文 → LLM 摘要 → 替换历史。"""
+        if self._compacting:
+            self._conversation.add_assistant_message("上下文正在压缩，请稍候。")
+            return
+        if not self._messages:
+            self._conversation.add_assistant_message("当前没有可压缩的对话内容。")
+            return
+        if not self._context_mgr:
+            self._conversation.add_assistant_message("上下文管理器未初始化。")
+            return
+
+        self._compacting = True
+        self._prompt.disabled = True
+        self._sidebar.set_status("压缩中")
+        self._status.update_status(
+            ready=False, round_no=self.round_no, model=self._model_label,
+            tool_calls=self.tool_calls_total,
+        )
+
+        try:
+            result = compact_messages(
+                self._messages, self._provider, project_root=os.getcwd()
+            )
+        except CompactionError as exc:
+            self._restore_after_compaction_failure(str(exc), exc.archive_id)
+            return
+        except Exception as exc:
+            self._restore_after_compaction_failure(f"未知错误：{exc}")
+            return
+
+        # 成功：替换历史（保留 System Prompt），并解除输入限制
+        self._messages = result.messages
+        self._context_mgr.reset_usage()
+        self._context_blocked = False
+        self._context_warned = False
+        self._compacting = False
+        self._prompt.disabled = False
+        self._update_context_display()
+        self._sidebar.set_status("就绪")
+        self._status.update_status(
+            ready=True, round_no=self.round_no, model=self._model_label,
+            tool_calls=self.tool_calls_total,
+        )
+        target_k = load_settings().summary_target_tokens / 1000
+        summary_k = estimate_tokens(result.summary) / 1000
+        self._conversation.add_assistant_message(
+            f"上下文压缩完成。\n"
+            f"归档编号：{result.archive_id}\n"
+            f"摘要约 {summary_k:.1f}k tokens（目标约 {target_k:g}k）\n\n"
+            f"{result.note}"
+        )
+        self._prompt.focus()
+
+    def _restore_after_compaction_failure(
+        self, reason: str, archive_id: Optional[str] = None
+    ) -> None:
+        """压缩失败：保留原有上下文，允许重新执行 /compact。"""
+        self._compacting = False
+        self._prompt.disabled = False
+        self._sidebar.set_status("就绪")
+        self._status.update_status(
+            ready=True, round_no=self.round_no, model=self._model_label,
+            tool_calls=self.tool_calls_total,
+        )
+        detail = f"\n归档编号：{archive_id}" if archive_id else ""
+        self._conversation.add_assistant_message(
+            f"上下文压缩失败：{reason}{detail}\n"
+            "原有上下文已保留，可修正问题后重新执行 /compact。"
+        )
+        self._prompt.focus()
 
     def _run_user_turn(self, user_text: str) -> None:
         self._ensure_skill_prompt()
         self._conversation.add_user_message(user_text)
         self._messages.append(LLMMessage(role="user", content=user_text))
+        self._update_context_display()
 
         model_label = self._model_label
         self._status.update_status(
@@ -747,9 +1571,11 @@ class XAgentApp(App):
         否则下一轮请求会被千帆判为消息格式错误
         （Message format error, index[i] should be [tool] but is [user]）。
         """
-        for _ in range(self._MAX_MODEL_CALLS):
+        for _ in range(self._max_model_calls):
+            sent_index = len(self._messages)
             response = self._provider.chat(self._messages, tools_schema)
             self._messages.append(response)
+            self._track_response_usage(response, sent_index)
 
             if not response.tool_calls:
                 if response.content:
@@ -762,9 +1588,10 @@ class XAgentApp(App):
                     self._conversation.add_tool_card(card)
                 self._messages.append(tool_msg)
                 self.tool_calls_total += 1
+                self._update_context_display()
 
         self._conversation.add_assistant_message(
-            f"（已达到单轮 {self._MAX_MODEL_CALLS} 次模型调用上限，停止继续调用工具）"
+            f"（已达到单轮 {self._max_model_calls} 次模型调用上限，停止继续调用工具）"
         )
 
     def _execute_tool(self, tc: ToolCall) -> tuple[Optional[ToolCallCard], LLMMessage]:
@@ -829,6 +1656,7 @@ class XAgentApp(App):
     # ---------- 快捷键 ----------
 
     def action_quit(self) -> None:
+        self._save_session(quiet=True)
         self.exit()
 
     def action_toggle_sidebar(self) -> None:
@@ -844,7 +1672,15 @@ class XAgentApp(App):
     def action_new_session(self) -> None:
         self._handle_command("/new")
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "prompt":
+            self._refresh_completion(event.value)
+
     def on_key(self, event) -> None:
+        if event.key == "escape" and self._completion_visible:
+            self.hide_completion()
+            event.stop()
+            return
         if event.key == "escape" and self._prompt.has_focus:
             self._prompt.value = ""
             event.stop()

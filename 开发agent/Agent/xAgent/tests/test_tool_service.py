@@ -13,10 +13,12 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from xAgent.core import ToolService, ToolResult, ToolInfo, TOOLS, call_tool
+from xAgent.core.config import Settings
 from xAgent.core.skills import (
     build_skill_prompt, discover_skills, reset_skill_registry,
 )
@@ -69,7 +71,7 @@ class TestToolInfo(unittest.TestCase):
             "get_current_working_directory", "list_directory", "get_file_type",
             "read_file", "create_file", "write_file", "create_directory",
             "delete_directory", "delete_file", "rename_item", "searchWeb",
-            "fetchWeb", "runCli", "loadSkill", "createSkill",
+            "fetchWeb", "runCli", "loadSkill", "createSkill", "recallContext",
         }
         self.assertEqual(set(TOOL_META.keys()), all_tools)
         self.assertEqual(set(TOOL_FUNCS.keys()), all_tools)
@@ -92,7 +94,7 @@ class TestToolServiceFacade(unittest.TestCase):
 
     def test_list_tools(self):
         tools = ToolService.list_tools()
-        self.assertEqual(len(tools), 15)
+        self.assertEqual(len(tools), 16)
         self.assertTrue(all(isinstance(t, ToolInfo) for t in tools))
 
     def test_get_tool_info(self):
@@ -267,44 +269,44 @@ class TestSearchWeb(unittest.TestCase):
     """searchWeb 工具：配置缺失 / 网络失败 / API 错误 / 正常解析。"""
 
     def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        self.ini = Path(self._tmp) / "config.ini"
-        self.patches = []
-        for target, value in (
-            ("xAgent.core.tools.CONFIG_INI", self.ini),
-            ("xAgent.core.config.CONFIG_INI", self.ini),
-            ("xAgent.core.tools.QIANFAN_SEARCH_URL", "https://example.test/search"),
-        ):
-            patcher = mock.patch(target, value)
-            patcher.start()
-            self.patches.append(patcher)
+        self.settings = Settings(
+            provider="qianfan",
+            api_key="test-key",
+            search_url="https://example.test/search",
+            search_timeout=5,
+        )
+        self.patcher = mock.patch(
+            "xAgent.core.tools.load_settings", return_value=self.settings
+        )
+        self.patcher.start()
 
     def tearDown(self):
-        for patcher in self.patches:
-            patcher.stop()
-        shutil.rmtree(self._tmp, ignore_errors=True)
-
-    def _write_ini(self, text):
-        self.ini.write_text(text, encoding="utf-8")
+        self.patcher.stop()
 
     def test_empty_query(self):
         r = ToolService.call("searchWeb", query="   ")
         self.assertFalse(r.success)
         self.assertIn("不能为空", r.error)
 
-    def test_missing_ini_file(self):
-        r = ToolService.call("searchWeb", query="天气")
-        self.assertFalse(r.success)
-        self.assertIn("缺少配置文件", r.error)
-
     def test_missing_key_option(self):
-        self._write_ini("[qianfan]\n")
-        r = ToolService.call("searchWeb", query="天气")
+        with mock.patch(
+            "xAgent.core.tools.load_settings",
+            return_value=replace(self.settings, api_key=""),
+        ):
+            r = ToolService.call("searchWeb", query="天气")
         self.assertFalse(r.success)
-        self.assertIn("baidu_qianfan_api_key", r.error)
+        self.assertIn("未配置", r.error)
+
+    def test_mock_provider_rejected(self):
+        with mock.patch(
+            "xAgent.core.tools.load_settings",
+            return_value=replace(self.settings, provider="mock"),
+        ):
+            r = ToolService.call("searchWeb", query="天气")
+        self.assertFalse(r.success)
+        self.assertIn("未配置", r.error)
 
     def test_network_failure(self):
-        self._write_ini("[qianfan]\nbaidu_qianfan_api_key = test-key\n")
         with mock.patch(
             "urllib.request.urlopen", side_effect=urllib.error.URLError("boom")
         ):
@@ -313,7 +315,6 @@ class TestSearchWeb(unittest.TestCase):
         self.assertIn("网络请求失败", r.error)
 
     def test_api_http_error(self):
-        self._write_ini("[qianfan]\nbaidu_qianfan_api_key = test-key\n")
         err = urllib.error.HTTPError(
             "https://example.test/search", 401, "Unauthorized", {},
             io.BytesIO(b'{"error":{"code":"invalid_appId","message":"no perm"}}'),
@@ -325,7 +326,6 @@ class TestSearchWeb(unittest.TestCase):
         self.assertIn("invalid_appId", r.error)
 
     def test_api_business_error(self):
-        self._write_ini("[qianfan]\nbaidu_qianfan_api_key = test-key\n")
         body = json.dumps({"code": "17", "message": "每日额度已用完"}).encode()
         with mock.patch("urllib.request.urlopen", return_value=_FakeResponse(body)):
             r = ToolService.call("searchWeb", query="天气")
@@ -333,7 +333,6 @@ class TestSearchWeb(unittest.TestCase):
         self.assertIn("每日额度已用完", r.error)
 
     def test_success_parsing(self):
-        self._write_ini("[qianfan]\nbaidu_qianfan_api_key = test-key\n")
         body = json.dumps({
             "choices": [{"message": {"content": "今天晴，25℃"}}],
             "references": [
@@ -458,7 +457,8 @@ class TestFetchWeb(unittest.TestCase):
         with mock.patch("xAgent.core.tools.shutil.which", return_value="curl"), \
              mock.patch("xAgent.core.tools.subprocess.run",
                         return_value=self._completed(stdout=self.HTML)), \
-             mock.patch("xAgent.core.tools._MAX_MARKDOWN_CHARS", 80):
+             mock.patch("xAgent.core.tools.load_settings",
+                        return_value=Settings(fetch_max_chars=80)):
             r = ToolService.call("fetchWeb", url="https://example.com/post")
         self.assertTrue(r.success)
         self.assertTrue(r.data["truncated"])
@@ -524,7 +524,8 @@ class TestRunCli(unittest.TestCase):
         self.assertIn("42", r.data["stdout"])
 
     def test_output_truncated(self):
-        with mock.patch("xAgent.core.tools._CLI_MAX_STREAM_CHARS", 50):
+        with mock.patch("xAgent.core.tools.load_settings",
+                        return_value=Settings(cli_max_output_chars=50)):
             r = ToolService.call(
                 "runCli", command=sys.executable,
                 args=self._py("print('x' * 200)"),

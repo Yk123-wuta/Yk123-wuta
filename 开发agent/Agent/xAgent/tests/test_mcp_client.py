@@ -1,18 +1,26 @@
 # -*- coding: utf-8 -*-
 """MCPClient 单元测试：配置解析、结果转换、动态注册。"""
 
+import asyncio
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from mcp import types
 
 from xAgent.core import ToolService
-from xAgent.core.mcp_client import load_mcp_config, convert_call_result
+from xAgent.core.mcp_client import (
+    MCPServerConfig, MCPClientManager, _ServerState, _ServerStatus,
+    is_connection_error, load_mcp_config, convert_call_result,
+)
 from xAgent.core.registry import (
     TOOL_META, TOOL_FUNCS, register_tool, unregister_tool,
     _sanitize_tool_name, _mcp_parameters,
+    _register_server_tools, _unregister_server_tools,
 )
 from xAgent.core.types import ToolInfo
 
@@ -147,6 +155,216 @@ class TestDynamicRegistration(unittest.TestCase):
     def test_register_duplicate_is_rejected(self):
         info = ToolInfo(name="read_file", description="dup")
         self.assertFalse(register_tool("read_file", info, lambda **kw: {}))
+
+
+class TestConnectionErrorDetection(unittest.TestCase):
+    def test_connection_errors(self):
+        self.assertTrue(is_connection_error("httpx.ConnectError: connection refused"))
+        self.assertTrue(is_connection_error(RuntimeError("连接被中断")))
+        self.assertTrue(is_connection_error("Broken pipe"))
+        self.assertTrue(is_connection_error("RemoteProtocolError: disconnected"))
+
+    def test_non_connection_errors(self):
+        self.assertFalse(is_connection_error("参数错误: path is required"))
+        self.assertFalse(is_connection_error(RuntimeError("MCP 工具返回错误")))
+
+
+class _FakeStack:
+    async def aclose(self) -> None:
+        pass
+
+
+class _FakeRunner:
+    """在测试中用 asyncio.run 执行协程，可注入固定异常模拟调用失败。"""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+
+    def submit(self, coro, timeout: float = 15.0):
+        if self.error is not None:
+            coro.close()
+            raise self.error
+        return asyncio.run(coro)
+
+    def stop(self) -> None:
+        pass
+
+
+def _fake_tools(*names: str):
+    return [
+        SimpleNamespace(name=name, description=f"{name} 工具", input_schema={})
+        for name in names
+    ]
+
+
+class TestReconnect(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.manager = MCPClientManager(self.tmp.name)
+        self.manager.reconnect_delays = (0.05, 0.1)
+
+    def tearDown(self) -> None:
+        self.manager.shutdown()
+        self.tmp.cleanup()
+
+    def _fake_state(self, name: str, tools=("ping",)) -> _ServerState:
+        return _ServerState(
+            config=MCPServerConfig(name=name, url="http://127.0.0.1:1/mcp"),
+            stack=_FakeStack(),
+            session=object(),
+            tools=_fake_tools(*tools),
+        )
+
+    def test_reconnect_recovers_with_backoff(self):
+        """前两次失败后成功，事件回调依次收到重试/失败/恢复通知。"""
+        events: list[tuple[str, str]] = []
+        done = threading.Event()
+
+        def on_event(event: str, server: str, detail: str = "") -> None:
+            events.append((event, server))
+            if event == "connected":
+                done.set()
+
+        self.manager.set_event_callback(on_event)
+        calls = {"n": 0}
+
+        async def fake_open(cfg):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("ConnectError: connection refused")
+            return self._fake_state(cfg.name, tools=("ping", "pong"))
+
+        self.manager._runner = _FakeRunner()
+        self.manager._open_server = fake_open
+        self.manager._statuses["A"] = _ServerStatus(
+            config=MCPServerConfig(name="A", url="http://127.0.0.1:1/mcp"),
+            state="reconnecting",
+        )
+        self.manager._schedule_reconnect("A")
+
+        self.assertTrue(done.wait(3), f"未在预期时间内恢复：{events}")
+        self.assertEqual(events.count(("connected", "A")), 1)
+        self.assertIn(("reconnecting", "A"), events)
+        self.assertIn(("reconnect_failed", "A"), events)
+
+        snapshot = self.manager.server_states()[0]
+        self.assertEqual(snapshot["state"], "connected")
+        self.assertEqual(snapshot["attempt"], 0)
+        self.assertEqual(snapshot["tools"], ["ping", "pong"])
+        self.assertEqual(self.manager._reconnect_timers, {})
+
+    def test_failed_server_does_not_affect_others(self):
+        """一个 Server 持续失败时，另一个已连接的 Server 保持可用。"""
+        self.manager._runner = _FakeRunner()
+        self.manager._open_server = None
+
+        async def always_fail(cfg):
+            raise RuntimeError("ConnectError: refused")
+
+        self.manager._open_server = always_fail
+        self.manager._statuses["A"] = _ServerStatus(
+            config=MCPServerConfig(name="A", url="http://127.0.0.1:1/mcp"),
+            state="reconnecting",
+        )
+        self.manager._statuses["B"] = _ServerStatus(
+            config=MCPServerConfig(name="B", url="http://127.0.0.1:2/mcp"),
+            state="connected",
+        )
+        self.manager._servers["B"] = self._fake_state("B", tools=("ping",))
+
+        self.manager._schedule_reconnect("A")
+        time.sleep(0.25)
+        self.manager._reconnect_timers.get("A")  # 仍在重试中被清理后重新排期
+
+        states = {st["name"]: st for st in self.manager.server_states()}
+        self.assertEqual(states["B"]["state"], "connected")
+        self.assertEqual(states["B"]["tools"], ["ping"])
+        self.assertNotEqual(states["A"]["state"], "connected")
+        self.assertIn("A", states["A"]["name"])
+
+    def test_call_tool_connection_error_triggers_reconnect(self):
+        self.manager.reconnect_delays = (5.0,)
+        self.manager._runner = _FakeRunner(
+            error=RuntimeError("httpx.ConnectError: connection refused")
+        )
+        self.manager._open_server = None
+        self.manager._statuses["A"] = _ServerStatus(
+            config=MCPServerConfig(name="A", url="http://127.0.0.1:1/mcp"),
+            state="connected",
+        )
+        self.manager._servers["A"] = self._fake_state("A")
+        self.manager._bindings["A__ping"] = ("A", "ping")
+
+        result = self.manager.call_tool("A__ping", {})
+
+        self.assertFalse(result["success"])
+        self.assertIn("自动重连", result["error"])
+        self.assertEqual(self.manager._statuses["A"].state, "reconnecting")
+        self.assertEqual(self.manager._servers, {})
+        self.assertIn("A", self.manager._reconnect_timers)
+
+    def test_server_states_reports_retry_countdown(self):
+        self.manager._statuses["A"] = _ServerStatus(
+            config=MCPServerConfig(name="A", url="http://127.0.0.1:1/mcp"),
+            state="reconnecting",
+            attempt=2,
+            last_error="ConnectError",
+            retry_in=2.0,
+            next_retry_at=time.monotonic() + 2.0,
+        )
+        snapshot = self.manager.server_states()[0]
+        self.assertEqual(snapshot["state"], "reconnecting")
+        self.assertEqual(snapshot["attempt"], 2)
+        self.assertEqual(snapshot["last_error"], "ConnectError")
+        self.assertGreater(snapshot["retry_in"], 0.5)
+        self.assertLessEqual(snapshot["retry_in"], 2.0)
+
+
+class _FakeManager:
+    def __init__(self, servers) -> None:
+        self.servers = servers
+        self.bindings: dict = {}
+
+    def server_tools(self, server: str):
+        return list(self.servers.get(server, []))
+
+    def bind(self, exposed: str, server: str, tool_name: str) -> None:
+        self.bindings[exposed] = (server, tool_name)
+
+    def unbind(self, exposed: str) -> None:
+        self.bindings.pop(exposed, None)
+
+
+class TestMcpToolRegistration(unittest.TestCase):
+    def tearDown(self) -> None:
+        _unregister_server_tools("A")
+        _unregister_server_tools("B")
+
+    def test_reconnect_reregisters_without_duplicates(self):
+        manager = _FakeManager({"A": _fake_tools("ping")})
+        self.assertEqual(_register_server_tools(manager, "A"), ["ping"])
+        # 重复注册：先清理旧工具，不应产生重复项
+        self.assertEqual(_register_server_tools(manager, "A"), ["ping"])
+        self.assertEqual(list(TOOL_META).count("ping"), 1)
+
+        # 服务恢复后工具列表变化：旧工具失效，新工具可用
+        manager.servers["A"] = _fake_tools("pong")
+        self.assertEqual(_register_server_tools(manager, "A"), ["pong"])
+        self.assertNotIn("ping", TOOL_FUNCS)
+        self.assertIn("pong", TOOL_FUNCS)
+        self.assertEqual(manager.bindings, {"pong": ("A", "pong")})
+
+    def test_servers_are_isolated_and_conflicts_prefixed(self):
+        manager = _FakeManager({
+            "A": _fake_tools("read_file"),
+            "B": _fake_tools("ping"),
+        })
+        self.assertEqual(_register_server_tools(manager, "A"), ["A__read_file"])
+        self.assertEqual(_register_server_tools(manager, "B"), ["ping"])
+
+        _unregister_server_tools("A")
+        self.assertNotIn("A__read_file", TOOL_FUNCS)
+        self.assertIn("ping", TOOL_FUNCS)
 
 
 if __name__ == "__main__":

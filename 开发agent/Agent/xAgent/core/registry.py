@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import shlex
 import threading
@@ -19,6 +20,7 @@ from typing import Any, Callable, Dict, List
 
 from .types import ToolResult, ToolInfo
 from .mcp_client import get_mcp_manager
+from .context import recall_context
 from .tools import (
     get_current_working_directory,
     list_directory,
@@ -35,6 +37,13 @@ from .tools import (
     run_cli,
 )
 from .skills import load_skill, create_skill
+
+
+# ---------- 上下文归档检索包装 ----------
+
+def _recall_context(id: str = "", text: str = "") -> dict:
+    """recallContext 工具：以当前项目目录为根检索历史归档。"""
+    return recall_context(text=text, archive_id=id or None, project_root=os.getcwd())
 
 
 # ---------- 工具注册表（兼容旧版 dict-of-dict 结构） ----------
@@ -150,6 +159,18 @@ TOOL_META: Dict[str, ToolInfo] = {
             "skillContext": "str: 写入 SKILL.md 的完整内容，可包含 frontmatter 与正文（必需）",
         },
     ),
+    "recallContext": ToolInfo(
+        name="recallContext",
+        description=(
+            "检索上下文压缩时保存的历史归档（.agents/context/*.jsonl）："
+            "按关键词返回原始对话片段、归档编号与消息位置。"
+            "当压缩摘要缺少某些历史细节时使用"
+        ),
+        parameters={
+            "text": "str: 要查找的关键词或文本内容（必需）",
+            "id": "str: 归档编号，如 20261022-153000（可选，不填则检索全部归档）",
+        },
+    ),
 }
 
 # 工具函数绑定
@@ -169,6 +190,7 @@ TOOL_FUNCS: Dict[str, Callable[..., dict]] = {
     "runCli": run_cli,
     "loadSkill": load_skill,
     "createSkill": create_skill,
+    "recallContext": _recall_context,
 }
 
 # 兼容旧版 TOOLS dict 格式
@@ -188,6 +210,11 @@ _MCP_LOCK = threading.Lock()
 _MCP_READY = False
 _MCP_NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
 _MAX_TOOL_NAME = 64
+
+# 注册表读写锁：后台 MCP 重连线程与 TUI 轮询会并发访问
+_TOOL_LOCK = threading.RLock()
+# 记录「已注册的 MCP 工具名 -> 所属 Server」，用于按 Server 注销
+_MCP_TOOL_SERVERS: Dict[str, str] = {}
 
 
 def _sanitize_tool_name(value: str, fallback: str = "mcp_tool") -> str:
@@ -216,30 +243,114 @@ def _mcp_parameters(input_schema: Dict[str, Any]) -> Dict[str, str]:
 
 def register_tool(name: str, info: ToolInfo, func: Callable[..., dict]) -> bool:
     """动态注册一个工具；名称已存在时返回 False（不覆盖）。"""
-    if not name or name in TOOL_FUNCS:
-        return False
-    TOOL_META[name] = info
-    TOOL_FUNCS[name] = func
-    TOOLS[name] = {
-        "func": func,
-        "description": info.description,
-        "parameters": dict(info.parameters),
-    }
-    return True
+    with _TOOL_LOCK:
+        if not name or name in TOOL_FUNCS:
+            return False
+        TOOL_META[name] = info
+        TOOL_FUNCS[name] = func
+        TOOLS[name] = {
+            "func": func,
+            "description": info.description,
+            "parameters": dict(info.parameters),
+        }
+        return True
 
 
 def unregister_tool(name: str) -> bool:
     """注销动态工具（测试或断开 MCP Server 时使用）。"""
-    if name not in TOOL_META:
-        return False
-    TOOL_META.pop(name, None)
-    TOOL_FUNCS.pop(name, None)
-    TOOLS.pop(name, None)
-    return True
+    with _TOOL_LOCK:
+        if name not in TOOL_META:
+            return False
+        TOOL_META.pop(name, None)
+        TOOL_FUNCS.pop(name, None)
+        TOOLS.pop(name, None)
+        _MCP_TOOL_SERVERS.pop(name, None)
+        return True
 
 
-def _ensure_mcp_tools() -> None:
-    """首次访问工具列表时连接 MCP Server 并注册其工具（幂等）。"""
+def _unregister_server_tools(server: str, manager=None) -> List[str]:
+    """注销某个 MCP Server 当前已注册的全部工具。"""
+    manager = manager if manager is not None else _mcp_manager_safe()
+    removed: List[str] = []
+    with _TOOL_LOCK:
+        for exposed, owner in list(_MCP_TOOL_SERVERS.items()):
+            if owner != server:
+                continue
+            TOOL_META.pop(exposed, None)
+            TOOL_FUNCS.pop(exposed, None)
+            TOOLS.pop(exposed, None)
+            _MCP_TOOL_SERVERS.pop(exposed, None)
+            removed.append(exposed)
+            if manager is not None:
+                manager.unbind(exposed)
+    return removed
+
+
+def _register_server_tools(manager, server: str) -> List[str]:
+    """
+    为单个 MCP Server 注册工具：先清理该 Server 的旧工具，再按最新列表注册。
+
+    这样重连后不会出现重复工具或残留的失效工具。
+    """
+    with _TOOL_LOCK:
+        _unregister_server_tools(server, manager)
+        planned: set[str] = set()
+        registered: List[str] = []
+        for tool in manager.server_tools(server):
+            base = _sanitize_tool_name(getattr(tool, "name", ""))
+            exposed = base
+            if exposed in TOOL_FUNCS or exposed in planned:
+                exposed = _sanitize_tool_name(f"{server}__{base}")
+            suffix = 2
+            while exposed in TOOL_FUNCS or exposed in planned:
+                expose_suffix = f"_{suffix}"
+                exposed = exposed[: _MAX_TOOL_NAME - len(expose_suffix)] + expose_suffix
+                suffix += 1
+
+            schema = getattr(tool, "input_schema", None) or {}
+            if hasattr(schema, "model_dump"):
+                schema = schema.model_dump()
+            schema = copy.deepcopy(dict(schema)) if isinstance(schema, dict) else {}
+
+            info = ToolInfo(
+                name=exposed,
+                description=(
+                    getattr(tool, "description", "") or
+                    f"MCP 工具 {server}/{base}"
+                ),
+                parameters=_mcp_parameters(schema),
+                input_schema=schema,
+            )
+            if not register_tool(exposed, info, _make_mcp_caller(manager, exposed)):
+                continue
+            _MCP_TOOL_SERVERS[exposed] = server
+            planned.add(exposed)
+            manager.bind(exposed, server, str(getattr(tool, "name", base)))
+            registered.append(exposed)
+        return registered
+
+
+def _on_mcp_event(event: str, server: str, detail: str = "") -> None:
+    """MCP 连接状态回调：断开时注销工具，恢复后重新注册。"""
+    if not _MCP_READY:
+        return
+    manager = _mcp_manager_safe()
+    if manager is None:
+        return
+    if event == "connected":
+        _register_server_tools(manager, server)
+    elif event in ("lost", "reconnect_failed"):
+        _unregister_server_tools(server)
+
+
+def ensure_mcp_tools() -> None:
+    """
+    连接 MCP Server 并注册其工具（幂等、线程安全）。
+
+    TUI 会在后台线程调用它，避免启动时阻塞；CLI 可以直接同步调用。
+    连接失败的 Server 由 manager 在后台按退避策略自动重连，
+    恢复后通过事件回调重新注册其工具。
+    """
     global _MCP_READY
     if _MCP_READY:
         return
@@ -251,43 +362,15 @@ def _ensure_mcp_tools() -> None:
         manager = None
         try:
             manager = get_mcp_manager()
+            manager.set_event_callback(_on_mcp_event)
             manager.initialize()
         except Exception as exc:
             if manager is not None:
-                manager.warnings.append(f"MCP 客户端初始化失败：{exc}")
+                manager.add_warning(f"MCP 客户端初始化失败：{exc}")
             return
 
-        planned: set[str] = set()
         for server in manager.connected_servers():
-            for tool in manager.server_tools(server):
-                base = _sanitize_tool_name(getattr(tool, "name", ""))
-                exposed = base
-                if exposed in TOOL_FUNCS or exposed in planned:
-                    exposed = _sanitize_tool_name(f"{server}__{base}")
-                suffix = 2
-                while exposed in TOOL_FUNCS or exposed in planned:
-                    expose_suffix = f"_{suffix}"
-                    exposed = exposed[: _MAX_TOOL_NAME - len(expose_suffix)] + expose_suffix
-                    suffix += 1
-
-                schema = getattr(tool, "input_schema", None) or {}
-                if hasattr(schema, "model_dump"):
-                    schema = schema.model_dump()
-                schema = copy.deepcopy(dict(schema)) if isinstance(schema, dict) else {}
-
-                info = ToolInfo(
-                    name=exposed,
-                    description=(
-                        getattr(tool, "description", "") or
-                        f"MCP 工具 {server}/{base}"
-                    ),
-                    parameters=_mcp_parameters(schema),
-                    input_schema=schema,
-                )
-                if not register_tool(exposed, info, _make_mcp_caller(manager, exposed)):
-                    continue
-                planned.add(exposed)
-                manager.bind(exposed, server, str(getattr(tool, "name", base)))
+            _register_server_tools(manager, server)
 
 
 def _mcp_manager_safe():
@@ -305,17 +388,43 @@ def _make_mcp_caller(manager, exposed_name: str) -> Callable[..., dict]:
 
 
 def get_mcp_warnings() -> List[str]:
-    """返回 MCP 配置/连接阶段的警告（会触发一次初始化）。"""
-    _ensure_mcp_tools()
+    """返回 MCP 配置/连接阶段的警告（不触发初始化）。"""
     manager = _mcp_manager_safe()
     return list(manager.warnings) if manager is not None else []
+
+
+def mcp_status() -> List[tuple[str, List[str]]]:
+    """返回 [(服务器名, [工具名...])]，供 TUI 边栏展示。"""
+    manager = _mcp_manager_safe()
+    if manager is None:
+        return []
+    return [
+        (
+            server,
+            [str(getattr(tool, "name", "")) for tool in manager.server_tools(server)],
+        )
+        for server in manager.connected_servers()
+    ]
+
+
+def mcp_server_states() -> List[Dict[str, Any]]:
+    """
+    返回所有 MCP Server 的连接状态快照（含重连进度），供 TUI 轮询展示。
+
+    每个元素包含：name / url / state / attempt / last_error / retry_in / tools。
+    """
+    manager = _mcp_manager_safe()
+    if manager is None:
+        return []
+    return manager.server_states()
 
 
 # ---------- 类型转换 ----------
 
 def _convert_kwargs(tool_name: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     """根据 ToolInfo.parameters 声明的类型字符串做轻量转换。"""
-    meta = TOOL_META[tool_name]
+    with _TOOL_LOCK:
+        meta = TOOL_META[tool_name]
     # 外部工具（MCP）的参数已由 LLM 按 JSON Schema 传入，无需再做字符串转换
     if meta.input_schema is not None:
         return dict(kwargs)
@@ -371,14 +480,18 @@ def call_tool(tool_name: str, **kwargs: Any) -> dict:
 
 def call_tool_result(tool_name: str, **kwargs: Any) -> ToolResult:
     """调用工具，返回 ToolResult（UI 层推荐用这个）。"""
-    if tool_name not in TOOL_FUNCS:
-        _ensure_mcp_tools()
-    if tool_name not in TOOL_FUNCS:
+    with _TOOL_LOCK:
+        func = TOOL_FUNCS.get(tool_name)
+    if func is None:
+        ensure_mcp_tools()
+    with _TOOL_LOCK:
+        func = TOOL_FUNCS.get(tool_name)
+    if func is None:
         return ToolResult.fail(f"未知工具: {tool_name}")
 
     try:
         converted = _convert_kwargs(tool_name, kwargs)
-        raw = TOOL_FUNCS[tool_name](**converted)
+        raw = func(**converted)
         # tools.py 函数已经返回 dict，直接转 ToolResult
         return ToolResult.from_dict(raw)
     except TypeError as e:
@@ -399,15 +512,20 @@ class ToolService:
 
     @staticmethod
     def list_tools() -> List[ToolInfo]:
-        """获取所有工具的元数据列表（用于渲染工具选择器、参数表单）。"""
-        _ensure_mcp_tools()
-        return list(TOOL_META.values())
+        """获取当前已注册的工具（不会触发 MCP 连接，便于界面先行渲染）。"""
+        with _TOOL_LOCK:
+            return list(TOOL_META.values())
 
     @staticmethod
     def get_tool_info(name: str) -> ToolInfo | None:
         """按名称查工具元数据。"""
-        _ensure_mcp_tools()
-        return TOOL_META.get(name)
+        with _TOOL_LOCK:
+            return TOOL_META.get(name)
+
+    @staticmethod
+    def ensure_mcp() -> None:
+        """显式连接 MCP Server 并注册工具（CLI / 后台线程调用）。"""
+        ensure_mcp_tools()
 
     @staticmethod
     def call(tool_name: str, **kwargs: Any) -> ToolResult:

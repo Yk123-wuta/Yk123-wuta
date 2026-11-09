@@ -22,12 +22,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from .config import (
-    CONFIG_INI,
-    QIANFAN_SEARCH_MODEL,
-    QIANFAN_SEARCH_URL,
-    read_search_api_key,
-)
+from .config import load_settings
 
 
 # ============ 1. get_current_working_directory ============
@@ -389,7 +384,7 @@ def _search_error(message: str, **extra) -> dict:
     return {"success": False, "error": message, **extra}
 
 
-def search_web(query: str, top_k: int = 10) -> dict:
+def search_web(query: str, top_k: int = 0) -> dict:
     """
     联网搜索：调用百度千帆「智能搜索生成」API，返回摘要与参考来源。
 
@@ -409,35 +404,30 @@ def search_web(query: str, top_k: int = 10) -> dict:
     query = query.strip()
 
     # ---------- 1. 读取配置 ----------
-    if not CONFIG_INI.exists():
+    settings = load_settings()
+    api_key = settings.api_key
+    if not api_key or settings.provider.lower() == "mock":
         return _search_error(
-            f"缺少配置文件：{CONFIG_INI}。"
-            f"请在 [qianfan] 段落下配置 baidu_qianfan_api_key。"
+            f"配置项缺失：{settings.config_path} 中 [llm] provider / api_key 未配置。"
+            f"请填写真实 API Key 后重试。"
         )
 
-    try:
-        api_key = read_search_api_key()
-    except RuntimeError as exc:
-        return _search_error(str(exc))
-
-    if not api_key:
-        return _search_error(
-            f"配置项缺失：{CONFIG_INI} 中 [qianfan] baidu_qianfan_api_key 为空。"
-            f"请填写千帆 API Key 后重试。"
-        )
+    if top_k <= 0:
+        top_k = settings.search_top_k
+    top_k = max(1, min(int(top_k), 10))
 
     # ---------- 2. 构造请求 ----------
     payload = {
         "messages": [{"role": "user", "content": query}],
-        "model": QIANFAN_SEARCH_MODEL,
+        "model": settings.search_model,
         "search_source": "baidu_search_v2",
-        "resource_type_filter": [{"type": "web", "top_k": int(top_k)}],
+        "resource_type_filter": [{"type": "web", "top_k": top_k}],
         "search_mode": "required",
         "stream": False,
         "enable_corner_markers": True,
     }
     request = urllib.request.Request(
-        QIANFAN_SEARCH_URL,
+        settings.search_url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -448,7 +438,7 @@ def search_web(query: str, top_k: int = 10) -> dict:
 
     # ---------- 3. 发起请求 ----------
     try:
-        with urllib.request.urlopen(request, timeout=60) as resp:
+        with urllib.request.urlopen(request, timeout=settings.search_timeout) as resp:
             raw = resp.read().decode("utf-8", "ignore")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore")
@@ -532,9 +522,6 @@ def _parse_api_error(detail: str) -> tuple[str, str]:
 
 # ============ 12. fetch_web ============
 
-_CURL_TIMEOUT = 30            # 单次网页下载总超时（秒）
-_CURL_CONNECT_TIMEOUT = 10    # 连接阶段超时（秒）
-_MAX_MARKDOWN_CHARS = 20000   # 正文上限，超出截断以节省上下文 Token
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -604,6 +591,7 @@ def fetch_web(url: str) -> dict:
         )
 
     # ---------- 1. 调用本地 curl 下载 HTML（参数列表，不使用 shell） ----------
+    settings = load_settings()
     curl_path = shutil.which("curl")
     if not curl_path:
         return _fetch_error("未找到 curl 命令，请确认系统已安装 curl 并加入 PATH")
@@ -615,8 +603,8 @@ def fetch_web(url: str) -> dict:
         "--fail",                              # 4xx/5xx 视为失败
         "--silent",
         "--show-error",
-        "--max-time", str(_CURL_TIMEOUT),
-        "--connect-timeout", str(_CURL_CONNECT_TIMEOUT),
+        "--max-time", str(settings.fetch_timeout),
+        "--connect-timeout", str(settings.fetch_connect_timeout),
         "--user-agent", _USER_AGENT,
         "--header", "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
         url,
@@ -627,13 +615,15 @@ def fetch_web(url: str) -> dict:
         proc = subprocess.run(
             command,
             capture_output=True,
-            timeout=_CURL_TIMEOUT + 10,
+            timeout=settings.fetch_timeout + 10,
             check=False,
         )
     except FileNotFoundError:
         return _fetch_error(f"未找到 curl 可执行文件：{curl_path}")
     except subprocess.TimeoutExpired:
-        return _fetch_error(f"网页访问超时：超过 {_CURL_TIMEOUT} 秒未收到响应")
+        return _fetch_error(
+            f"网页访问超时：超过 {settings.fetch_timeout:g} 秒未收到响应"
+        )
     except OSError as exc:
         return _fetch_error(f"调用 curl 失败：{exc}")
 
@@ -685,10 +675,10 @@ def fetch_web(url: str) -> dict:
 
     title = _extract_title(trafilatura, html, url)
 
-    truncated = len(markdown) > _MAX_MARKDOWN_CHARS
+    truncated = len(markdown) > settings.fetch_max_chars
     if truncated:
         markdown = (
-            markdown[:_MAX_MARKDOWN_CHARS]
+            markdown[:settings.fetch_max_chars]
             + "\n\n…（正文过长已截断，完整内容请查看原网页）"
         )
 
@@ -707,11 +697,6 @@ def fetch_web(url: str) -> dict:
 
 
 # ============ 13. run_cli ============
-
-_CLI_TIMEOUT = 30          # 默认超时（秒）
-_CLI_MAX_TIMEOUT = 120     # 允许的最大超时（秒）
-_CLI_MAX_STREAM_CHARS = 8000   # stdout / stderr 各自的最大字符数
-
 
 def _cli_error(message: str, **extra) -> dict:
     """CLI 执行失败的统一返回结构。"""
@@ -738,7 +723,8 @@ def _split_args(value: str) -> list:
 
 def _truncate_stream(text: str, limit: int | None = None) -> tuple[str, bool]:
     """截断过长输出，返回 (文本, 是否截断)。"""
-    limit = _CLI_MAX_STREAM_CHARS if limit is None else limit
+    if limit is None:
+        limit = load_settings().cli_max_output_chars
     if len(text) <= limit:
         return text, False
     return (
@@ -747,7 +733,7 @@ def _truncate_stream(text: str, limit: int | None = None) -> tuple[str, bool]:
     )
 
 
-def run_cli(command: str, args=None, timeout: int = _CLI_TIMEOUT) -> dict:
+def run_cli(command: str, args=None, timeout: int = 0) -> dict:
     """
     执行本地命令行程序（参数列表 + shell=False，不做命令字符串拼接）。
 
@@ -785,11 +771,13 @@ def run_cli(command: str, args=None, timeout: int = _CLI_TIMEOUT) -> dict:
     else:
         return _cli_error(f"参数 args 必须是列表，实际收到：{type(args).__name__}")
 
+    settings = load_settings()
     try:
-        limit = int(timeout)
+        parsed_timeout = int(timeout)
     except (TypeError, ValueError):
-        limit = _CLI_TIMEOUT
-    limit = max(1, min(limit, _CLI_MAX_TIMEOUT))
+        parsed_timeout = 0
+    limit = parsed_timeout if parsed_timeout > 0 else settings.cli_timeout
+    limit = max(1, min(limit, settings.cli_max_timeout))
 
     argv = [command, *arg_list]
 
